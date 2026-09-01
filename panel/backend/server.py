@@ -46,7 +46,7 @@ from starlette.routing import Route
 # MCP/rag/server.py) — same reasoning as RightBar.svelte's own cross-boundary
 # workaround: this file lives in a different directory, so the import needs
 # an explicit path rather than a package install.
-sys.path.insert(0, "/home/murad/Documents/llama.cpp/MCP/rag")
+sys.path.insert(0, "/home/murad/Documents/GitHub/llama.cpp/MCP/rag")
 import rag_core  # noqa: E402
 
 PORT = int(os.environ.get("PANEL_PORT", "9010"))

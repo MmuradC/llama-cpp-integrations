@@ -288,7 +288,7 @@ index 0000000..7e608c8
 +	// SvelteKit requires a route file to physically exist under src/routes for
 +	// its router to discover a page at all — this is that file, made as small
 +	// as that constraint allows. The actual page lives outside this tree; see
-+	// /home/murad/Documents/llama.cpp/panel/README.md.
++	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
 +	import NimPage from '@mcp-panel/NimPage.svelte';
 +</script>
 +
@@ -303,7 +303,7 @@ index 0000000..2772d53
 +	// SvelteKit requires a route file to physically exist under src/routes for
 +	// its router to discover a page at all — this is that file, made as small
 +	// as that constraint allows. The actual page lives outside this tree; see
-+	// /home/murad/Documents/llama.cpp/panel/README.md.
++	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
 +	import OpenRouterPage from '@mcp-panel/OpenRouterPage.svelte';
 +</script>
 +
@@ -319,10 +319,10 @@ index 0f24a60..43750f8 100644
 -				'katex-fonts': resolve('node_modules/katex/dist/fonts')
 +				'katex-fonts': resolve('node_modules/katex/dist/fonts'),
 +				// Right-bar panel: lives entirely outside this tree, see
-+				// /home/murad/Documents/llama.cpp/panel/README.md. This alias plus
++				// /home/murad/Documents/GitHub/llama.cpp/panel/README.md. This alias plus
 +				// the one import + one render line in routes/+layout.svelte is the
 +				// whole diff against upstream — everything else is out here.
-+				'@mcp-panel': '/home/murad/Documents/llama.cpp/panel/frontend'
++				'@mcp-panel': '/home/murad/Documents/GitHub/llama.cpp/panel/frontend'
  			}
  		},
  
@@ -332,7 +332,7 @@ index 0f24a60..43750f8 100644
 +				allow: [
 +					searchForWorkspaceRoot(process.cwd()),
 +					resolve(__dirname, 'tests'),
-+					'/home/murad/Documents/llama.cpp/panel/frontend'
++					'/home/murad/Documents/GitHub/llama.cpp/panel/frontend'
 +				]
  			},
  			headers: {

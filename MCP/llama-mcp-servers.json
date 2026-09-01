@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "filesystem": {
-      "command": "/home/murad/Documents/llama.cpp/MCP/mcp-filesystem/node_modules/.bin/mcp-server-filesystem",
+      "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/mcp-filesystem/node_modules/.bin/mcp-server-filesystem",
       "args": [
         "/home/murad/Documents/GitHub",
         "/home/murad/Downloads",
@@ -35,9 +35,9 @@
       "timeout_ms": 120000
     },
     "imagegen": {
-      "command": "/home/murad/Documents/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/.venv/bin/python",
       "args": [
-        "/home/murad/Documents/llama.cpp/MCP/imagegen/server.py"
+        "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/server.py"
       ],
       "env": {
         "SD_SERVER_URL": "http://127.0.0.1:1234",
@@ -47,9 +47,9 @@
       "timeout_ms": 900000
     },
     "nim": {
-      "command": "/home/murad/Documents/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/.venv/bin/python",
       "args": [
-        "/home/murad/Documents/llama.cpp/MCP/nim/server.py"
+        "/home/murad/Documents/GitHub/llama.cpp/MCP/nim/server.py"
       ],
       "env": {
         "NVIDIA_API_KEY_FILE": "/home/murad/.config/nvidia-nim.key",
@@ -58,9 +58,9 @@
       "timeout_ms": 300000
     },
     "openrouter": {
-      "command": "/home/murad/Documents/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/.venv/bin/python",
       "args": [
-        "/home/murad/Documents/llama.cpp/MCP/openrouter/server.py"
+        "/home/murad/Documents/GitHub/llama.cpp/MCP/openrouter/server.py"
       ],
       "env": {
         "OPENROUTER_API_KEY_FILE": "/home/murad/.config/mcp-secrets/openrouter.key",
@@ -95,9 +95,9 @@
       "timeout_ms": 60000
     },
     "rag": {
-      "command": "/home/murad/Documents/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/.venv/bin/python",
       "args": [
-        "/home/murad/Documents/llama.cpp/MCP/rag/server.py"
+        "/home/murad/Documents/GitHub/llama.cpp/MCP/rag/server.py"
       ],
       "env": {
         "LLAMA_SERVER_URL": "http://127.0.0.1:8080",
