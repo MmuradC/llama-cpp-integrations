@@ -1,0 +1,12 @@
+# llama.cpp source forks are their own git repos, not tracked here
+/fork/
+
+# model weights — huge binaries, download separately per device
+/models/
+
+# generated / environment cruft
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/venv/
+**/node_modules/

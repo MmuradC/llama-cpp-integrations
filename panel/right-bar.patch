@@ -1,0 +1,339 @@
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+index d605451..a65eee1 100644
+--- a/tools/server/server-models.cpp
++++ b/tools/server/server-models.cpp
+@@ -28,6 +28,7 @@
+ #include <random>
+ #include <sstream>
+ #include <cstring>
++#include <fstream>
+ 
+ #ifndef _WIN32
+ extern char **environ;
+@@ -48,6 +49,21 @@ extern char **environ;
+ // ref: https://github.com/ggml-org/llama.cpp/issues/17862
+ #define CHILD_ADDR "127.0.0.1"
+ 
++// port of the external panel backend (panel/backend/server.py, outside this
++// tree entirely — see panel/README.md) that every SERVER_MODEL_SOURCE_REMOTE
++// model is registered against. It is never spawned as a child: proxy_request()
++// just forwards to CHILD_ADDR:port like any other model, and that backend
++// reads the request body's "model" field to know which real upstream id to
++// call, so every remote model can safely share this one port.
++#define REMOTE_MODEL_PANEL_PORT 9010
++
++// Directory holding each provider's pinned-models file, written by the
++// panel's "Pin to chat" actions (panel/frontend/*Page.svelte -> POST
++// /api/{provider}/pin on the same backend above). Read fresh on every
++// load_models() call (first boot and ?reload=true) so pin/unpin can take
++// effect without a full restart. See load_remote_model_presets().
++#define REMOTE_MODELS_DIR "/home/murad/.config/mcp-secrets/"
++
+ struct server_subproc {
+     common_subproc sproc; // not yet spawned while in DOWNLOADING state
+     std::atomic<bool> stopped{false}; // set to cancel a download or signal child process exit
+@@ -297,6 +313,68 @@ static std::filesystem::path get_server_exec_path() {
+ #endif
+ }
+ 
++// Loads one provider's pinned-models file into name -> empty-preset pairs
++// (registered id = "<provider>/<sanitized real id>"). The preset is
++// deliberately empty: these models are never spawned (see the
++// SERVER_MODEL_SOURCE_REMOTE handling in load_models()), so there are no
++// CLI args to render — the name alone (and the fixed port assigned later)
++// is all proxy_request() needs to forward chat requests to the panel
++// backend, which dispatches to the right upstream API by provider prefix.
++static common_presets load_remote_model_presets_for(const std::string & provider, const std::string & filename) {
++    common_presets result;
++    std::ifstream f(filename);
++    if (!f.is_open()) {
++        return result; // no pins yet, not an error
++    }
++    try {
++        json data = json::parse(f);
++        if (!data.is_array()) {
++            return result;
++        }
++        for (const auto & entry : data) {
++            if (!entry.is_object()) {
++                continue;
++            }
++            std::string id = entry.value("id", std::string());
++            if (id.empty()) {
++                continue;
++            }
++            // llama.cpp's own normalizeModelName() (tools/ui/src/lib/utils/
++            // model-names.ts) only preserves an id with EXACTLY one slash
++            // when it persists which model produced a reply; two or more
++            // collapses to just the last segment, silently losing the
++            // provider prefix and making the id unresolvable on the next
++            // message in that conversation. Real provider ids (vendor/model)
++            // have their own inner slash, so every "/" here becomes "__",
++            // leaving exactly one real slash overall. Must match
++            // panel/backend/server.py's _registered_id() exactly.
++            std::string sanitized = id;
++            size_t pos = 0;
++            while ((pos = sanitized.find('/', pos)) != std::string::npos) {
++                sanitized.replace(pos, 1, "__");
++                pos += 2;
++            }
++            result[provider + "/" + sanitized] = common_preset{};
++        }
++    } catch (const std::exception & e) {
++        SRV_WRN("failed to parse %s: %s\n", filename.c_str(), e.what());
++    }
++    return result;
++}
++
++// One call per supported remote provider — adding a new provider (see
++// panel/backend/server.py's PROVIDERS dict) is one more line here.
++static common_presets load_remote_model_presets() {
++    common_presets result;
++    for (auto & [name, preset] : load_remote_model_presets_for("openrouter", REMOTE_MODELS_DIR "openrouter-pinned-models.json")) {
++        result[name] = preset;
++    }
++    for (auto & [name, preset] : load_remote_model_presets_for("nim", REMOTE_MODELS_DIR "nim-pinned-models.json")) {
++        result[name] = preset;
++    }
++    return result;
++}
++
+ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
+     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
+     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
+@@ -544,6 +622,14 @@ void server_models::load_models() {
+         }
+         source_map[name] = SERVER_MODEL_SOURCE_PRESET;
+     }
++    // 4. pinned OpenRouter models — remote, never spawned. Registered here
++    // (not just added straight into `mapping`) so the reload-diff logic
++    // below sees them as "still present in source" instead of mistaking a
++    // pin for a removed model and trying to unload it.
++    for (const auto & [name, preset] : load_remote_model_presets()) {
++        final_presets[name] = preset;
++        source_map[name] = SERVER_MODEL_SOURCE_REMOTE;
++    }
+ 
+     // overlay router's own CLI args on top of every model preset so that
+     // e.g. `llama-server --temp 0` is honoured by all child processes
+@@ -624,6 +710,18 @@ void server_models::load_models() {
+             }
+         }
+     };
++    // SERVER_MODEL_SOURCE_REMOTE entries are added by both branches below
++    // exactly like any other source (status=UNLOADED, port=0), then fixed up
++    // here in one place: they are always already "loaded", pointing at the
++    // external panel backend's port, and are never spawned at all.
++    auto apply_remote_status = [&]() {
++        for (auto & [name, inst] : mapping) {
++            if (inst.meta.source == SERVER_MODEL_SOURCE_REMOTE) {
++                inst.meta.status = SERVER_MODEL_STATUS_LOADED;
++                inst.meta.port   = REMOTE_MODEL_PANEL_PORT;
++            }
++        }
++    };
+     auto apply_hidden = [&]() {
+         for (auto & [name, inst] : mapping) {
+             inst.meta.hidden = hidden_models.count(name) > 0;
+@@ -670,6 +768,7 @@ void server_models::load_models() {
+         }
+         apply_stop_timeout();
+         apply_hidden();
++        apply_remote_status();
+         log_available_models();
+ 
+         // skipped on reload, see startup_models
+@@ -848,6 +947,7 @@ void server_models::load_models() {
+ 
+         apply_stop_timeout();
+         apply_hidden();
++        apply_remote_status();
+ 
+         // clear reload flag under the lock, this releases the load() calls waiting on !is_reloading
+         is_reloading = false;
+@@ -1173,7 +1273,17 @@ void server_models::unload(const std::string & name) {
+     std::unique_lock<std::mutex> lk(mutex);
+     auto it = mapping.find(name);
+     if (it != mapping.end()) {
+-        if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
++        if (it->second.meta.source == SERVER_MODEL_SOURCE_REMOTE) {
++            // never spawned, so there is no monitoring thread to eventually
++            // call update_status() the way a real child would — reload's
++            // diff logic (load_models()) still calls unload() on an
++            // unpinned entry and waits for it to stop is_running(), so that
++            // transition has to happen synchronously right here or that
++            // wait blocks forever.
++            SRV_INF("unloading remote model name=%s (unpinned)\n", name.c_str());
++            it->second.meta.status = SERVER_MODEL_STATUS_UNLOADED;
++            cv.notify_all();
++        } else if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
+             SRV_INF("cancelling download for model name=%s\n", name.c_str());
+             it->second.subproc->request_exit();
+             // for convenience, we wait the status change here
+@@ -1859,7 +1969,15 @@ static std::optional<server_model_meta> resolve_child_for_conv(
+         return std::nullopt;
+     }
+     auto meta = models.get_meta(*tracked);
+-    if (meta.has_value() && meta->is_ready()) {
++    // SERVER_MODEL_SOURCE_REMOTE entries are always is_ready() (see
++    // load_models()'s apply_remote_status()) — they never actually spawn,
++    // so unlike a real child there is no notion of "this generation is
++    // still running" for stream-resume to key off. Without this check every
++    // conversation that ever sent one message to a remote model would look
++    // permanently resumable to callers of this function (stream lookup,
++    // resume, delete), proxying to the remote backend's port for a session
++    // it has no record of and was never designed to answer for.
++    if (meta.has_value() && meta->is_ready() && meta->source != SERVER_MODEL_SOURCE_REMOTE) {
+         return meta;
+     }
+     return std::nullopt;
+@@ -2154,6 +2272,19 @@ void server_models_routes::init_routes() {
+                                                   meta->status == SERVER_MODEL_STATUS_DOWNLOADED);
+             if (transient) {
+                 res_err(res, format_error_response("Stream owner model is loading, retry later", ERROR_TYPE_UNAVAILABLE));
++            } else if (meta.has_value() && meta->source == SERVER_MODEL_SOURCE_REMOTE) {
++                // resolve_child_for_conv() always excludes remote models (see
++                // there) — so this is not a stale/expired session, it is
++                // structural: a remote model has no way to resume a stream
++                // that was interrupted mid-generation. Distinct message so
++                // the web UI's error dialog says something the user can act
++                // on instead of the generic "not found or expired" — and
++                // deliberately NOT ERROR_TYPE_NOT_FOUND (404): httplib's
++                // global error_handler (server-http.cpp) unconditionally
++                // overwrites ANY 404 body with a generic "File Not Found",
++                // even one a handler set on purpose, so this message would
++                // never actually reach the client on that status code.
++                res_err(res, format_error_response("This conversation's model does not support resuming an interrupted response — send it again", ERROR_TYPE_INVALID_REQUEST));
+             } else {
+                 res_err(res, format_error_response("Stream not found or expired", ERROR_TYPE_NOT_FOUND));
+             }
+diff --git a/tools/server/server-models.h b/tools/server/server-models.h
+index 5cbb6a8..4d76505 100644
+--- a/tools/server/server-models.h
++++ b/tools/server/server-models.h
+@@ -41,6 +41,7 @@ enum server_model_source {
+     SERVER_MODEL_SOURCE_PRESET,
+     SERVER_MODEL_SOURCE_MODELS_DIR,
+     SERVER_MODEL_SOURCE_CACHE,
++    SERVER_MODEL_SOURCE_REMOTE, // not spawned: proxies to an external HTTP backend, see server-models.cpp load_models()
+ };
+ 
+ enum server_child_mode {
+@@ -65,6 +66,7 @@ static std::string server_model_source_to_string(server_model_source source) {
+         case SERVER_MODEL_SOURCE_PRESET:     return "preset";
+         case SERVER_MODEL_SOURCE_MODELS_DIR: return "models_dir";
+         case SERVER_MODEL_SOURCE_CACHE:      return "cache";
++        case SERVER_MODEL_SOURCE_REMOTE:     return "remote";
+         default:                             return "unknown";
+     }
+ }
+diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
+index b008b16..35ae56a 100644
+--- a/tools/ui/src/lib/services/chat.service.ts
++++ b/tools/ui/src/lib/services/chat.service.ts
+@@ -715,7 +715,23 @@ export class ChatService {
+ 
+ 				if (!resumeResp || resumeResp.status !== 200) {
+ 					onConnectionState?.(StreamConnectionState.LOST);
+-					onError?.(new Error('Stream connection lost and could not be resumed'));
++
++					// the server's own reason (e.g. "not found or expired" vs a
++					// remote model's "doesn't support resuming") is more useful
++					// than this generic fallback — read it when there is one
++					let detail = '';
++
++					if (resumeResp) {
++						try {
++							const body = await resumeResp.json();
++
++							if (body?.error?.message) detail = `: ${body.error.message}`;
++						} catch {
++							// no JSON body to read, keep the generic message
++						}
++					}
++
++					onError?.(new Error(`Stream connection lost and could not be resumed${detail}`));
+ 
+ 					break;
+ 				}
+diff --git a/tools/ui/src/routes/+layout.svelte b/tools/ui/src/routes/+layout.svelte
+index f87bbe2..0c7545b 100644
+--- a/tools/ui/src/routes/+layout.svelte
++++ b/tools/ui/src/routes/+layout.svelte
+@@ -5,6 +5,8 @@
+ 	import { base } from '$app/paths';
+ 	import { page } from '$app/state';
+ 	import { SidebarNavigation } from '$lib/components/app';
++	import { PanelRightClose, PanelRightOpen } from '@lucide/svelte';
++	import RightBar from '@mcp-panel/RightBar.svelte';
+ 	import { PwaMetaTags, PwaRefreshAlert } from '$lib/components/pwa';
+ 	import * as Tooltip from '$lib/components/ui/tooltip';
+ 	import {
+@@ -289,6 +291,8 @@
+ 		<div class="flex-1">
+ 			{@render children?.()}
+ 		</div>
++
++		<RightBar iconOpen={PanelRightOpen} iconClose={PanelRightClose} />
+ 	</div>
+ 
+ 	<ModeWatcher />
+diff --git a/tools/ui/src/routes/nim/+page.svelte b/tools/ui/src/routes/nim/+page.svelte
+new file mode 100644
+index 0000000..7e608c8
+--- /dev/null
++++ b/tools/ui/src/routes/nim/+page.svelte
+@@ -0,0 +1,9 @@
++<script lang="ts">
++	// SvelteKit requires a route file to physically exist under src/routes for
++	// its router to discover a page at all — this is that file, made as small
++	// as that constraint allows. The actual page lives outside this tree; see
++	// /home/murad/Documents/llama.cpp/panel/README.md.
++	import NimPage from '@mcp-panel/NimPage.svelte';
++</script>
++
++<NimPage />
+diff --git a/tools/ui/src/routes/openrouter/+page.svelte b/tools/ui/src/routes/openrouter/+page.svelte
+new file mode 100644
+index 0000000..2772d53
+--- /dev/null
++++ b/tools/ui/src/routes/openrouter/+page.svelte
+@@ -0,0 +1,9 @@
++<script lang="ts">
++	// SvelteKit requires a route file to physically exist under src/routes for
++	// its router to discover a page at all — this is that file, made as small
++	// as that constraint allows. The actual page lives outside this tree; see
++	// /home/murad/Documents/llama.cpp/panel/README.md.
++	import OpenRouterPage from '@mcp-panel/OpenRouterPage.svelte';
++</script>
++
++<OpenRouterPage />
+diff --git a/tools/ui/vite.config.ts b/tools/ui/vite.config.ts
+index 0f24a60..43750f8 100644
+--- a/tools/ui/vite.config.ts
++++ b/tools/ui/vite.config.ts
+@@ -47,13 +47,22 @@ export default defineConfig(({ mode }) => {
+ 
+ 		resolve: {
+ 			alias: {
+-				'katex-fonts': resolve('node_modules/katex/dist/fonts')
++				'katex-fonts': resolve('node_modules/katex/dist/fonts'),
++				// Right-bar panel: lives entirely outside this tree, see
++				// /home/murad/Documents/llama.cpp/panel/README.md. This alias plus
++				// the one import + one render line in routes/+layout.svelte is the
++				// whole diff against upstream — everything else is out here.
++				'@mcp-panel': '/home/murad/Documents/llama.cpp/panel/frontend'
+ 			}
+ 		},
+ 
+ 		server: {
+ 			fs: {
+-				allow: [searchForWorkspaceRoot(process.cwd()), resolve(__dirname, 'tests')]
++				allow: [
++					searchForWorkspaceRoot(process.cwd()),
++					resolve(__dirname, 'tests'),
++					'/home/murad/Documents/llama.cpp/panel/frontend'
++				]
+ 			},
+ 			headers: {
+ 				'Cross-Origin-Embedder-Policy': 'require-corp',

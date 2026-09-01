@@ -1,0 +1,110 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "/home/murad/Documents/llama.cpp/MCP/mcp-filesystem/node_modules/.bin/mcp-server-filesystem",
+      "args": [
+        "/home/murad/Documents/GitHub",
+        "/home/murad/Downloads",
+        "/home/murad/.config/mcp-secrets"
+      ],
+      "timeout_ms": 30000
+    },
+    "git": {
+      "command": "/home/murad/.local/bin/mcp-server-git",
+      "args": [],
+      "timeout_ms": 60000
+    },
+    "fetch": {
+      "command": "/home/murad/.local/bin/mcp-server-fetch",
+      "args": [],
+      "timeout_ms": 60000
+    },
+    "search": {
+      "command": "/home/murad/.local/bin/duckduckgo-mcp-server",
+      "args": [],
+      "timeout_ms": 60000
+    },
+    "markitdown": {
+      "command": "/home/murad/.local/bin/markitdown-mcp",
+      "args": [],
+      "timeout_ms": 120000
+    },
+    "pandoc": {
+      "command": "/home/murad/.local/bin/mcp-pandoc",
+      "args": [],
+      "timeout_ms": 120000
+    },
+    "imagegen": {
+      "command": "/home/murad/Documents/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "args": [
+        "/home/murad/Documents/llama.cpp/MCP/imagegen/server.py"
+      ],
+      "env": {
+        "SD_SERVER_URL": "http://127.0.0.1:1234",
+        "LLAMA_SERVER_URL": "http://127.0.0.1:8080",
+        "IMAGEGEN_OUTPUT": "/home/murad/Downloads"
+      },
+      "timeout_ms": 900000
+    },
+    "nim": {
+      "command": "/home/murad/Documents/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "args": [
+        "/home/murad/Documents/llama.cpp/MCP/nim/server.py"
+      ],
+      "env": {
+        "NVIDIA_API_KEY_FILE": "/home/murad/.config/nvidia-nim.key",
+        "NIM_MODEL": "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+      },
+      "timeout_ms": 300000
+    },
+    "openrouter": {
+      "command": "/home/murad/Documents/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "args": [
+        "/home/murad/Documents/llama.cpp/MCP/openrouter/server.py"
+      ],
+      "env": {
+        "OPENROUTER_API_KEY_FILE": "/home/murad/.config/mcp-secrets/openrouter.key",
+        "OPENROUTER_MODEL": "meta-llama/llama-3.3-70b-instruct"
+      },
+      "timeout_ms": 300000
+    },
+    "vision": {
+      "command": "/usr/bin/uvx",
+      "args": [
+        "shadow-vision==0.1.0"
+      ],
+      "env": {
+        "VISION_BACKEND": "openai_compatible",
+        "OPENAI_API_BASE": "http://127.0.0.1:8080/v1",
+        "VISION_MODEL": "qwen9b",
+        "OPENAI_API_KEY": "",
+        "OPENAI_MAX_TOKENS": "4096",
+        "VISION_READ_TIMEOUT": "220"
+      },
+      "timeout_ms": 260000
+    },
+    "browser": {
+      "command": "/usr/bin/npx",
+      "args": [
+        "--yes",
+        "@playwright/mcp@latest",
+        "--headless",
+        "--browser",
+        "chromium"
+      ],
+      "timeout_ms": 60000
+    },
+    "rag": {
+      "command": "/home/murad/Documents/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "args": [
+        "/home/murad/Documents/llama.cpp/MCP/rag/server.py"
+      ],
+      "env": {
+        "LLAMA_SERVER_URL": "http://127.0.0.1:8080",
+        "RAG_EMBED_MODEL": "embed",
+        "RAG_EMBED_TIMEOUT": "180"
+      },
+      "timeout_ms": 240000
+    }
+  }
+}
