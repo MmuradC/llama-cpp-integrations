@@ -1,8 +1,16 @@
 diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
-index d605451..a65eee1 100644
+index db0fac9..bed82a1 100644
 --- a/tools/server/server-models.cpp
 +++ b/tools/server/server-models.cpp
-@@ -28,6 +28,7 @@
+@@ -18,6 +18,7 @@
+ #include <algorithm>
+ #include <thread>
+ #include <mutex>
++#include <sstream>
+ #include <condition_variable>
+ #include <cstring>
+ #include <cstdlib>
+@@ -28,6 +29,7 @@
  #include <random>
  #include <sstream>
  #include <cstring>
@@ -10,7 +18,7 @@ index d605451..a65eee1 100644
  
  #ifndef _WIN32
  extern char **environ;
-@@ -48,6 +49,21 @@ extern char **environ;
+@@ -48,6 +50,21 @@ extern char **environ;
  // ref: https://github.com/ggml-org/llama.cpp/issues/17862
  #define CHILD_ADDR "127.0.0.1"
  
@@ -32,7 +40,33 @@ index d605451..a65eee1 100644
  struct server_subproc {
      common_subproc sproc; // not yet spawned while in DOWNLOADING state
      std::atomic<bool> stopped{false}; // set to cancel a download or signal child process exit
-@@ -297,6 +313,68 @@ static std::filesystem::path get_server_exec_path() {
+@@ -85,7 +102,8 @@ struct server_lru_sched {
+         std::string victim;
+         int64_t victim_last_used = 0;
+         for (const auto & m : models.mapping) {
+-            if (m.first == exclude) {
++            // never spawned, holds no slot: evicting it would not free capacity
++            if (m.first == exclude || m.second.meta.source == SERVER_MODEL_SOURCE_REMOTE) {
+                 continue;
+             }
+             // a busy model is mid-request, one still coming up has no request to finish
+@@ -241,6 +259,15 @@ struct server_lru_sched {
+     size_t count_running() {
+         size_t count = 0;
+         for (const auto & m : models.mapping) {
++            // apply_remote_status() marks every remote entry LOADED at
++            // startup (see load_models()), so without this exclusion
++            // count_running() never drops low enough for has_capacity() to
++            // free up: evicting one of several always-loaded remote models
++            // still leaves the rest counted, and a queued local model waits
++            // forever with try_claim() silently failing every 200ms.
++            if (m.second.meta.source == SERVER_MODEL_SOURCE_REMOTE) {
++                continue;
++            }
+             if (m.second.meta.is_running()) {
+                 count++;
+             }
+@@ -297,6 +324,73 @@ static std::filesystem::path get_server_exec_path() {
  #endif
  }
  
@@ -50,7 +84,9 @@ index d605451..a65eee1 100644
 +        return result; // no pins yet, not an error
 +    }
 +    try {
-+        json data = json::parse(f);
++        std::stringstream buffer;
++        buffer << f.rdbuf();
++        json data = json::parse(buffer.str());
 +        if (!data.is_array()) {
 +            return result;
 +        }
@@ -95,13 +131,16 @@ index d605451..a65eee1 100644
 +    for (auto & [name, preset] : load_remote_model_presets_for("nim", REMOTE_MODELS_DIR "nim-pinned-models.json")) {
 +        result[name] = preset;
 +    }
++    for (auto & [name, preset] : load_remote_model_presets_for("opencode", REMOTE_MODELS_DIR "opencode-pinned-models.json")) {
++        result[name] = preset;
++    }
 +    return result;
 +}
 +
  static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
      preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
      preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
-@@ -544,6 +622,14 @@ void server_models::load_models() {
+@@ -544,6 +638,14 @@ void server_models::load_models() {
          }
          source_map[name] = SERVER_MODEL_SOURCE_PRESET;
      }
@@ -116,7 +155,7 @@ index d605451..a65eee1 100644
  
      // overlay router's own CLI args on top of every model preset so that
      // e.g. `llama-server --temp 0` is honoured by all child processes
-@@ -624,6 +710,18 @@ void server_models::load_models() {
+@@ -624,6 +726,18 @@ void server_models::load_models() {
              }
          }
      };
@@ -135,7 +174,7 @@ index d605451..a65eee1 100644
      auto apply_hidden = [&]() {
          for (auto & [name, inst] : mapping) {
              inst.meta.hidden = hidden_models.count(name) > 0;
-@@ -670,6 +768,7 @@ void server_models::load_models() {
+@@ -670,6 +784,7 @@ void server_models::load_models() {
          }
          apply_stop_timeout();
          apply_hidden();
@@ -143,7 +182,7 @@ index d605451..a65eee1 100644
          log_available_models();
  
          // skipped on reload, see startup_models
-@@ -848,6 +947,7 @@ void server_models::load_models() {
+@@ -848,6 +963,7 @@ void server_models::load_models() {
  
          apply_stop_timeout();
          apply_hidden();
@@ -151,7 +190,18 @@ index d605451..a65eee1 100644
  
          // clear reload flag under the lock, this releases the load() calls waiting on !is_reloading
          is_reloading = false;
-@@ -1173,7 +1273,17 @@ void server_models::unload(const std::string & name) {
+@@ -996,6 +1112,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
+     if (base_params.models_max > 0) {
+         size_t count_active = 0;
+         for (const auto & m : mapping) {
++            // never spawned, does not hold a slot - see count_running() above
++            if (m.second.meta.source == SERVER_MODEL_SOURCE_REMOTE) {
++                continue;
++            }
+             if (m.second.meta.is_running()) {
+                 count_active++;
+             }
+@@ -1173,7 +1293,17 @@ void server_models::unload(const std::string & name) {
      std::unique_lock<std::mutex> lk(mutex);
      auto it = mapping.find(name);
      if (it != mapping.end()) {
@@ -170,7 +220,7 @@ index d605451..a65eee1 100644
              SRV_INF("cancelling download for model name=%s\n", name.c_str());
              it->second.subproc->request_exit();
              // for convenience, we wait the status change here
-@@ -1859,7 +1969,15 @@ static std::optional<server_model_meta> resolve_child_for_conv(
+@@ -1859,7 +1989,15 @@ static std::optional<server_model_meta> resolve_child_for_conv(
          return std::nullopt;
      }
      auto meta = models.get_meta(*tracked);
@@ -187,7 +237,7 @@ index d605451..a65eee1 100644
          return meta;
      }
      return std::nullopt;
-@@ -2154,6 +2272,19 @@ void server_models_routes::init_routes() {
+@@ -2154,6 +2292,19 @@ void server_models_routes::init_routes() {
                                                    meta->status == SERVER_MODEL_STATUS_DOWNLOADED);
              if (transient) {
                  res_err(res, format_error_response("Stream owner model is loading, retry later", ERROR_TYPE_UNAVAILABLE));
@@ -227,113 +277,130 @@ index 5cbb6a8..4d76505 100644
          default:                             return "unknown";
      }
  }
-diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
-index b008b16..35ae56a 100644
---- a/tools/ui/src/lib/services/chat.service.ts
-+++ b/tools/ui/src/lib/services/chat.service.ts
-@@ -715,7 +715,23 @@ export class ChatService {
+diff --git a/tools/server/server-tools.cpp b/tools/server/server-tools.cpp
+index 12e9dbb..5d83f9a 100644
+--- a/tools/server/server-tools.cpp
++++ b/tools/server/server-tools.cpp
+@@ -159,6 +159,9 @@ public:
+     virtual bool file_size(const std::string & path, uintmax_t & out_size) const = 0;
+     virtual bool read_file(const std::string & path, std::string & out) const = 0;
+     virtual bool write_file(const std::string & path, const std::string & content) const = 0;
++    // like write_file, but appends to an existing file (creating it, including
++    // parent directories, if it does not exist) instead of truncating it
++    virtual bool append_file(const std::string & path, const std::string & content) const = 0;
+     // resolve `path` against the IO's working directory; absolute paths are returned unchanged
+     virtual std::string resolve(const std::string & path) const = 0;
+     struct list_entry {
+@@ -351,19 +354,28 @@ public:
+         return true;
+     }
  
- 				if (!resumeResp || resumeResp.status !== 200) {
- 					onConnectionState?.(StreamConnectionState.LOST);
--					onError?.(new Error('Stream connection lost and could not be resumed'));
-+
-+					// the server's own reason (e.g. "not found or expired" vs a
-+					// remote model's "doesn't support resuming") is more useful
-+					// than this generic fallback — read it when there is one
-+					let detail = '';
-+
-+					if (resumeResp) {
-+						try {
-+							const body = await resumeResp.json();
-+
-+							if (body?.error?.message) detail = `: ${body.error.message}`;
-+						} catch {
-+							// no JSON body to read, keep the generic message
-+						}
-+					}
-+
-+					onError?.(new Error(`Stream connection lost and could not be resumed${detail}`));
+-    bool write_file(const std::string & path, const std::string & content) const override {
++    // shared by write_file/append_file, mode carries std::ios::app for the latter
++    bool write_file_impl(const std::string & path, const std::string & content, std::ios::openmode mode) const {
+         std::error_code ec;
+         fs::path fpath = path_from_utf8(resolve(path));
+         if (fpath.has_parent_path()) {
+             fs::create_directories(fpath.parent_path(), ec);
+             if (ec) return false;
+         }
+-        std::ofstream f(fpath, std::ios::binary);
++        std::ofstream f(fpath, mode);
+         if (!f) return false;
+         f << content;
+         return (bool) f;
+     }
  
- 					break;
- 				}
-diff --git a/tools/ui/src/routes/+layout.svelte b/tools/ui/src/routes/+layout.svelte
-index f87bbe2..0c7545b 100644
---- a/tools/ui/src/routes/+layout.svelte
-+++ b/tools/ui/src/routes/+layout.svelte
-@@ -5,6 +5,8 @@
- 	import { base } from '$app/paths';
- 	import { page } from '$app/state';
- 	import { SidebarNavigation } from '$lib/components/app';
-+	import { PanelRightClose, PanelRightOpen } from '@lucide/svelte';
-+	import RightBar from '@mcp-panel/RightBar.svelte';
- 	import { PwaMetaTags, PwaRefreshAlert } from '$lib/components/pwa';
- 	import * as Tooltip from '$lib/components/ui/tooltip';
- 	import {
-@@ -289,6 +291,8 @@
- 		<div class="flex-1">
- 			{@render children?.()}
- 		</div>
++    bool write_file(const std::string & path, const std::string & content) const override {
++        return write_file_impl(path, content, std::ios::binary);
++    }
 +
-+		<RightBar iconOpen={PanelRightOpen} iconClose={PanelRightClose} />
- 	</div>
- 
- 	<ModeWatcher />
-diff --git a/tools/ui/src/routes/nim/+page.svelte b/tools/ui/src/routes/nim/+page.svelte
-new file mode 100644
-index 0000000..7e608c8
---- /dev/null
-+++ b/tools/ui/src/routes/nim/+page.svelte
-@@ -0,0 +1,9 @@
-+<script lang="ts">
-+	// SvelteKit requires a route file to physically exist under src/routes for
-+	// its router to discover a page at all — this is that file, made as small
-+	// as that constraint allows. The actual page lives outside this tree; see
-+	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
-+	import NimPage from '@mcp-panel/NimPage.svelte';
-+</script>
++    bool append_file(const std::string & path, const std::string & content) const override {
++        return write_file_impl(path, content, std::ios::binary | std::ios::app);
++    }
 +
-+<NimPage />
-diff --git a/tools/ui/src/routes/openrouter/+page.svelte b/tools/ui/src/routes/openrouter/+page.svelte
-new file mode 100644
-index 0000000..2772d53
---- /dev/null
-+++ b/tools/ui/src/routes/openrouter/+page.svelte
-@@ -0,0 +1,9 @@
-+<script lang="ts">
-+	// SvelteKit requires a route file to physically exist under src/routes for
-+	// its router to discover a page at all — this is that file, made as small
-+	// as that constraint allows. The actual page lives outside this tree; see
-+	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
-+	import OpenRouterPage from '@mcp-panel/OpenRouterPage.svelte';
-+</script>
+     list_result list_entries(const std::string & base, int max_depth, list_kind kind) const override {
+         list_result out;
+ 
+@@ -564,9 +576,19 @@ public:
+     }
+ 
+     bool write_file(const std::string & path, const std::string & content) const override {
++        return write_file_impl(path, content, /*append=*/false);
++    }
 +
-+<OpenRouterPage />
-diff --git a/tools/ui/vite.config.ts b/tools/ui/vite.config.ts
-index 0f24a60..43750f8 100644
---- a/tools/ui/vite.config.ts
-+++ b/tools/ui/vite.config.ts
-@@ -47,13 +47,22 @@ export default defineConfig(({ mode }) => {
++    bool append_file(const std::string & path, const std::string & content) const override {
++        return write_file_impl(path, content, /*append=*/true);
++    }
++
++    // shared by write_file/append_file; the redirect operator is the only difference
++    bool write_file_impl(const std::string & path, const std::string & content, bool append) const {
+         // the content travels on stdin: no argv for the far side to re-parse, no temp file on the host
++        const std::string redirect = append ? ">>" : ">";
+         auto res = run_subprocess(
+-            build_argv({"sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "_", resolve(path)},
++            build_argv({"sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat " + redirect + " \"$1\"", "_", resolve(path)},
+                        /*needs_stdin=*/true),
+             4096, SERVER_TOOL_ISOLATE_EXEC_TIMEOUT, nullptr, true, "", &content);
+         return res.exit_code == 0 && !res.timed_out;
+@@ -1334,12 +1356,19 @@ struct server_tool_write_file : server_tool {
+             {"type", "function"},
+             {"function", {
+                 {"name", name},
+-                {"description", "Write content to a file, creating it (including parent directories) if it does not exist. May use with edit_file for more complex edits."},
++                {"description", "Create a new file, or fully overwrite an existing one. To change only part of an "
++                                "existing file (e.g. a line, a function, a config value), use edit_file instead - it is "
++                                "faster, safer, and does not require rewriting content that isn't changing. If the "
++                                "content is long (roughly a few thousand words or more), do not write it all in one "
++                                "call: it can get cut off mid-output. Instead call this once with append=false to start "
++                                "the file, then one or more times more with append=true to add the rest in smaller "
++                                "pieces."},
+                 {"parameters", {
+                     {"type", "object"},
+                     {"properties", {
+-                        {"path",    {{"type", "string"}, {"description", "Path of the file to write"}}},
+-                        {"content", {{"type", "string"}, {"description", "Content to write"}}},
++                        {"path",    {{"type", "string"},  {"description", "Path of the file to write"}}},
++                        {"content", {{"type", "string"},  {"description", "Content to write"}}},
++                        {"append",  {{"type", "boolean"}, {"description", "Append to the end of the file instead of overwriting it (default: false). Use this to continue a file started by a previous write_file call."}}},
+                     }},
+                     {"required", json::array({"path", "content"})},
+                 }},
+@@ -1350,13 +1379,19 @@ struct server_tool_write_file : server_tool {
+     json invoke(json params, server_tool::stream *) const override {
+         std::string path    = params.at("path").get<std::string>();
+         std::string content = params.at("content").get<std::string>();
++        bool append          = json_value(params, "append", false);
  
- 		resolve: {
- 			alias: {
--				'katex-fonts': resolve('node_modules/katex/dist/fonts')
-+				'katex-fonts': resolve('node_modules/katex/dist/fonts'),
-+				// Right-bar panel: lives entirely outside this tree, see
-+				// /home/murad/Documents/GitHub/llama.cpp/panel/README.md. This alias plus
-+				// the one import + one render line in routes/+layout.svelte is the
-+				// whole diff against upstream — everything else is out here.
-+				'@mcp-panel': '/home/murad/Documents/GitHub/llama.cpp/panel/frontend'
- 			}
- 		},
+         auto io = make_tools_io(params);
+-        if (!io->write_file(path, content)) {
+-            return {{"error", "failed to write file: " + path}};
++        bool ok = append ? io->append_file(path, content) : io->write_file(path, content);
++        if (!ok) {
++            return {{"error", std::string("failed to ") + (append ? "append to" : "write") + " file: " + path}};
+         }
  
- 		server: {
- 			fs: {
--				allow: [searchForWorkspaceRoot(process.cwd()), resolve(__dirname, 'tests')]
-+				allow: [
-+					searchForWorkspaceRoot(process.cwd()),
-+					resolve(__dirname, 'tests'),
-+					'/home/murad/Documents/GitHub/llama.cpp/panel/frontend'
-+				]
- 			},
- 			headers: {
- 				'Cross-Origin-Embedder-Policy': 'require-corp',
+-        return {{"result", "file written successfully"}, {"path", path}, {"bytes", content.size()}};
++        return {
++            {"result", append ? "content appended successfully" : "file written successfully"},
++            {"path", path},
++            {"bytes", content.size()},
++        };
+     }
+ };
+ 
+@@ -1378,9 +1413,12 @@ struct server_tool_edit_file : server_tool {
+             {"function", {
+                 {"name", name},
+                 {"description",
+-                    "Edit a file using exact text replacement. Each edits[].old_text must be unique in the file "
++                    "Change part of an existing file by exact text replacement, without rewriting the rest of "
++                    "it. Prefer this over write_file whenever the file already exists and only a line, a "
++                    "function, or a section needs to change. Each edits[].old_text must be unique in the file "
+                     "and is matched against the original content, not incrementally. Merge nearby changes into "
+-                    "one edit instead of overlapping edits. Use write_file to replace the whole file."},
++                    "one edit instead of overlapping edits. Only use write_file if you are creating a new file "
++                    "or truly replacing the entire content."},
+                 {"parameters", {
+                     {"type", "object"},
+                     {"properties", {

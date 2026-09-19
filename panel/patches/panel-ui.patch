@@ -1,0 +1,1580 @@
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatForm.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatForm.svelte
+index 893f807..a2dffd9 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatForm.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatForm.svelte
+@@ -32,6 +32,7 @@
+ 		conversationsStore,
+ 		mcpStore,
+ 		modelsStore,
++		pendingImagePathStore,
+ 		serverStore,
+ 		settingsStore,
+ 		toolsStore
+@@ -171,6 +172,19 @@
+ 		}
+ 	});
+ 
++	// A paste/drop the active model can't see inline (see
++	// use-chat-screen-file-upload.svelte.ts) lands here as a saved file path
++	// instead, once the upload finishes - append it rather than dropping it.
++	$effect(() => {
++		const path = pendingImagePathStore.path;
++
++		if (!path) return;
++
++		value = value ? `${value} ${path}` : path;
++		onValueChange?.(value);
++		pendingImagePathStore.consume();
++	});
++
+ 	async function handleWorkingDirectoryChange(newDir: string | null) {
+ 		// Committing a directory consumes the `/cwd` token; the chip's
+ 		// clear-X path has no token to consume.
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActions.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActions.svelte
+index 395f2cf..daed33f 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActions.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActions.svelte
+@@ -8,6 +8,11 @@
+ 		ChatFormActionSubmit,
+ 		ChatFormContextGauge
+ 	} from '$lib/components/app';
++	// Relative, not through the $lib/components/app barrel like the import
++	// above: this dial must render independently of hasProcessedTokens below
++	// (see its own file for why), so it isn't a peer of ChatFormContextGauge
++	// in that barrel's public surface, just a sibling file reached directly.
++	import OpenCodeUsageDial from '../ChatFormContextGauge/OpenCodeUsageDial.svelte';
+ 	import { Button } from '$lib/components/ui/button';
+ 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
+ 	import { setChatFormActionsContext } from '$lib/contexts';
+@@ -159,6 +164,8 @@
+ 			<ChatFormContextGauge />
+ 		{/if}
+ 
++		<OpenCodeUsageDial />
++
+ 		{#if showModelSelector}
+ 			<ChatFormActionModels
+ 				bind:hasAudioModality
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
+index 8fa09cf..97af089 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
+@@ -8,11 +8,42 @@
+ 		gaugePopup,
+ 		gaugePopupClose
+ 	} from './gauge-popup.svelte';
++	import { Loader2, PackageMinus } from '@lucide/svelte';
++	import { Button } from '$lib/components/ui/button';
+ 	import { useContextGauge } from '$lib/hooks/use-context-gauge.svelte';
++	import { chatStore } from '$lib/stores';
+ 	import { formatParameters } from '$lib/utils/formatters';
+ 
+ 	const gauge = useContextGauge();
+ 
++	// Local action state, same shape as the panel's own one-off async actions
++	// (e.g. OpenRouterPage's pin button): a busy flag plus a one-line error,
++	// nothing global - compaction is a self-contained action, not something
++	// other components need to observe.
++	let isCompacting = $state(false);
++	let compactError = $state('');
++	// The numbers above are computed from the LAST ASSISTANT message's own
++	// server-reported timings (see context-stats.svelte.ts) - compacting adds
++	// a synthetic USER-role message, which has no timings, so the gauge stays
++	// exactly where it was until the next real reply comes back with a
++	// freshly evaluated (now much smaller) prompt_n. Without this note that
++	// reads as "the button did nothing" even though the trim is already
++	// wired in and will apply to the very next message.
++	let compactSucceeded = $state(false);
++
++	async function handleCompact() {
++		isCompacting = true;
++		compactError = '';
++		compactSucceeded = false;
++
++		const result = await chatStore.compactConversation();
++
++		if (result.ok) compactSucceeded = true;
++		else compactError = result.error ?? 'Failed to compact';
++
++		isCompacting = false;
++	}
++
+ 	// The gauge hook wraps a processing state instance that only follows the
+ 	// live stream while its own monitoring flag is set, so the card instance
+ 	// starts monitoring like the dial does.
+@@ -50,6 +81,47 @@
+ 			gauge.contextTotal > 0 &&
+ 			(gauge.activeModelId !== null || gauge.isActiveModelLoaded)
+ 	);
++
++	// OpenCode usage estimate — self-contained the same way compaction above
++	// is (own fetch, own state), not routed through the shared gauge hook,
++	// since it is specific to one remote provider rather than a general
++	// context-window concern. See panel/backend/server.py's opencode_usage()
++	// docstring: this is a LOCAL, ESTIMATED count against a reference table
++	// read off the console once (2026-09-13), not official OpenCode data —
++	// there is no usage API to poll instead.
++	const openCodeModelId = $derived(
++		gauge.activeModelId?.startsWith('opencode/') ? gauge.activeModelId : null
++	);
++	let openCodeUsage = $state<{ count_5h: number; limit_5h: number | null } | null>(null);
++	let openCodeUsageError = $state('');
++
++	$effect(() => {
++		const modelId = openCodeModelId;
++
++		if (!modelId || !gaugePopup.open) {
++			return;
++		}
++
++		openCodeUsageError = '';
++
++		fetch(`http://127.0.0.1:9010/api/opencode/usage?model=${encodeURIComponent(modelId)}`, {
++			signal: AbortSignal.timeout(6000)
++		})
++			.then((res) => {
++				if (!res.ok) throw new Error(`HTTP ${res.status}`);
++				return res.json();
++			})
++			.then((body) => {
++				openCodeUsage = { count_5h: body.count_5h, limit_5h: body.limit_5h };
++			})
++			.catch((err) => {
++				openCodeUsageError = err instanceof Error ? err.message : 'Failed to load usage';
++			});
++	});
++
++	const openCodePercent = $derived(
++		openCodeUsage?.limit_5h ? Math.min(100, Math.round((openCodeUsage.count_5h / openCodeUsage.limit_5h) * 100)) : null
++	);
+ </script>
+ 
+ {#if gaugePopup.open}
+@@ -98,6 +170,31 @@
+ 						{formatParameters(gauge.contextAvailable ?? 0)} remaining
+ 					</span>
+ 				</div>
++
++				<Button
++					size="sm"
++					variant="secondary"
++					class="self-start"
++					disabled={isCompacting}
++					onclick={handleCompact}
++				>
++					{#if isCompacting}
++						<Loader2 class="h-3.5 w-3.5 animate-spin" />
++						Compacting...
++					{:else}
++						<PackageMinus class="h-3.5 w-3.5" />
++						Compact conversation
++					{/if}
++				</Button>
++
++				{#if compactError}
++					<span class="text-xs text-destructive">{compactError}</span>
++				{:else if compactSucceeded}
++					<span class="text-xs text-emerald-500">
++						Compacted. The numbers above won't drop until your next message — that's when
++						the server reports the new, smaller prompt size.
++					</span>
++				{/if}
+ 			{:else}
+ 				<div class="text-xs text-muted-foreground">No context info available</div>
+ 			{/if}
+@@ -116,6 +213,39 @@
+ 					transientDetails={gauge.transientDetails}
+ 				/>
+ 			{/if}
++
++			{#if openCodeModelId}
++				<div class="flex flex-col gap-1 border-t border-border/50 pt-2">
++					<div class="flex items-center gap-2 text-xs">
++						<span class="font-medium">OpenCode Go</span>
++						<span class="text-muted-foreground">·</span>
++						{#if openCodeUsage}
++							<span class="font-mono text-muted-foreground">
++								{openCodeUsage.count_5h}{openCodeUsage.limit_5h ? ` / ${openCodeUsage.limit_5h}` : ''}
++								req (~5h)
++							</span>
++						{:else if openCodeUsageError}
++							<span class="text-destructive">{openCodeUsageError}</span>
++						{:else}
++							<span class="text-muted-foreground">Loading…</span>
++						{/if}
++					</div>
++
++					{#if openCodePercent !== null}
++						<div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
++							<div
++								class="h-full rounded-full bg-foreground/60 transition-all duration-300"
++								style="width: {openCodePercent}%"
++							></div>
++						</div>
++					{/if}
++
++					<span class="text-[10px] text-muted-foreground">
++						Local estimate against a reference table, not official OpenCode data — see console
++						for exact usage.
++					</span>
++				</div>
++			{/if}
+ 		</div>
+ 	</div>
+ {/if}
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/OpenCodeUsageDial.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/OpenCodeUsageDial.svelte
+new file mode 100644
+index 0000000..66b47bf
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/OpenCodeUsageDial.svelte
+@@ -0,0 +1,98 @@
++<script lang="ts">
++	// Deliberately its own component, NOT folded into ChatFormContextGauge.svelte:
++	// that one is only rendered by ChatFormActions.svelte behind
++	// {#if hasProcessedTokens}, which checks for llama.cpp-specific
++	// `timings` on assistant messages (see hasProcessedTokens in
++	// ChatFormActions.svelte). A pinned remote model (OpenRouter/NIM/OpenCode)
++	// never gets a `timings` object — the relay just forwards the provider's
++	// own OpenAI-shaped chunks (panel/backend/server.py's remote_chat_completions)
++	// — so that condition is permanently false for this conversation and the
++	// whole gauge area, dial included, never mounted. This component has its
++	// own always-evaluated guard (openCodeModelId) instead, so it shows up
++	// regardless of whether any local-model token stats exist.
++	//
++	// Reuses the same trigger classes/handlers and data-context-gauge-trigger
++	// attribute as ChatFormContextGauge's own dial so a click/hover here
++	// opens the exact same shared popup (ContextGaugePopup.svelte, which is
++	// unconditionally mounted from ChatForm.svelte and already renders this
++	// same usage estimate as text+bar) at the correct position relative to
++	// THIS element.
++	import { colorLevelFromPercent } from './context-gauge';
++	import ContextGaugeDial from './ContextGaugeDial.svelte';
++	import {
++		gaugeTriggerClick,
++		gaugeTriggerEnter,
++		gaugeTriggerKeydown,
++		gaugeTriggerLeave,
++		gaugeTriggerPointerDown
++	} from './gauge-popup.svelte';
++	import { useContextGauge } from '$lib/hooks/use-context-gauge.svelte';
++	import { onDestroy } from 'svelte';
++
++	const gauge = useContextGauge();
++
++	const openCodeModelId = $derived(
++		gauge.activeModelId?.startsWith('opencode/') ? gauge.activeModelId : null
++	);
++	let openCodePercent = $state<number | null>(null);
++	let pollHandle: ReturnType<typeof setInterval> | null = null;
++
++	async function pollUsage(modelId: string) {
++		try {
++			const res = await fetch(
++				`http://127.0.0.1:9010/api/opencode/usage?model=${encodeURIComponent(modelId)}`,
++				{ signal: AbortSignal.timeout(6000) }
++			);
++
++			if (!res.ok) throw new Error(`HTTP ${res.status}`);
++
++			const body = await res.json();
++
++			openCodePercent =
++				typeof body.limit_5h === 'number' && body.limit_5h > 0
++					? Math.min(100, Math.round((body.count_5h / body.limit_5h) * 100))
++					: null;
++		} catch {
++			// dial just shows an empty ring until the next successful poll
++		}
++	}
++
++	$effect(() => {
++		const modelId = openCodeModelId;
++
++		if (pollHandle !== null) {
++			clearInterval(pollHandle);
++			pollHandle = null;
++		}
++
++		if (!modelId) {
++			openCodePercent = null;
++
++			return;
++		}
++
++		void pollUsage(modelId);
++		pollHandle = setInterval(() => void pollUsage(modelId), 20000);
++	});
++
++	onDestroy(() => {
++		if (pollHandle !== null) clearInterval(pollHandle);
++	});
++</script>
++
++{#if openCodeModelId}
++	<div
++		aria-label="OpenCode Go usage (~5h window, local estimate)"
++		class="flex h-5 w-5 cursor-default items-center justify-center"
++		data-context-gauge-trigger
++		onclick={gaugeTriggerClick}
++		onkeydown={gaugeTriggerKeydown}
++		onpointerdown={gaugeTriggerPointerDown}
++		onpointerenter={gaugeTriggerEnter}
++		onpointerleave={gaugeTriggerLeave}
++		role="button"
++		tabindex="0"
++	>
++		<ContextGaugeDial level={colorLevelFromPercent(openCodePercent)} percent={openCodePercent} />
++	</div>
++{/if}
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageCompactionSummary.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageCompactionSummary.svelte
+new file mode 100644
+index 0000000..65a3acf
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageCompactionSummary.svelte
+@@ -0,0 +1,47 @@
++<script lang="ts">
++	import { ChevronDown, PackageCheck } from '@lucide/svelte';
++	import * as Collapsible from '$lib/components/ui/collapsible';
++	import type { DatabaseMessage } from '$lib/types';
++	import { formatCompactionStats, parseCompactionMessage } from '$lib/utils';
++
++	interface Props {
++		class?: string;
++		message: DatabaseMessage;
++	}
++
++	let { class: className = '', message }: Props = $props();
++
++	// Parse the synthetic message content in the UI so the row reuses the
++	// exact same summary text the model sees on later turns.
++	let summary = $derived(parseCompactionMessage(message.content));
++	// Only present on messages compacted after this feature shipped - older
++	// compaction messages just don't show the line, nothing to backfill.
++	let statsLabel = $derived(
++		message.compactionStats ? formatCompactionStats(message.compactionStats) : null
++	);
++	let isOpen = $state(false);
++</script>
++
++{#if summary !== null}
++	<Collapsible.Root bind:open={isOpen} class="py-1.5 {className}">
++		<Collapsible.Trigger
++			class="flex items-center gap-2 text-muted-foreground hover:text-foreground"
++		>
++			<PackageCheck class="text-muted-foreground/60 h-3.5 w-3.5 shrink-0" />
++
++			<span class="text-foreground/80 text-sm font-medium">Conversation compacted</span>
++
++			<ChevronDown
++				class={'h-3.5 w-3.5 shrink-0 transition-transform' + (isOpen ? ' rotate-180' : '')}
++			/>
++		</Collapsible.Trigger>
++
++		{#if statsLabel}
++			<p class="text-muted-foreground/60 ml-5.5 text-xs">{statsLabel}</p>
++		{/if}
++
++		<Collapsible.Content class="mt-1.5 ml-5.5 text-sm whitespace-pre-wrap text-muted-foreground">
++			{summary}
++		</Collapsible.Content>
++	</Collapsible.Root>
++{/if}
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte
+index 546a2c5..efebf15 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte
+@@ -1,7 +1,8 @@
+ <script lang="ts">
++	import ChatMessageCompactionSummary from './ChatMessageCompactionSummary.svelte';
+ 	import ChatMessageCwdChange from './ChatMessageCwdChange.svelte';
+ 	import type { DatabaseMessage } from '$lib/types';
+-	import { parseCwdMessage } from '$lib/utils';
++	import { parseCompactionMessage, parseCwdMessage } from '$lib/utils';
+ 
+ 	interface Props {
+ 		class?: string;
+@@ -14,10 +15,13 @@
+ 	// kind today is the working-directory change; parse the content so the
+ 	// row reuses the exact synthetic text (and future kinds slot in here).
+ 	let isCwdChange = $derived(parseCwdMessage(message.content) !== null);
++	let isCompactionSummary = $derived(parseCompactionMessage(message.content) !== null);
+ </script>
+ 
+ {#if isCwdChange}
+ 	<ChatMessageCwdChange class={className} {message} />
++{:else if isCompactionSummary}
++	<ChatMessageCompactionSummary class={className} {message} />
+ {:else}
+ 	<span class="text-muted-foreground block text-sm {className}">{message.content}</span>
+ {/if}
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte
+index 93d8990..a1fcc25 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte
+@@ -41,6 +41,14 @@
+ 	});
+ 
+ 	const audioMimeType = $derived(readMediaMeta?.mimeType ?? MimeTypeAudio.MP3_MPEG);
++
++	// No [Attachment saved: ...] marker means extractBase64Attachments found no
++	// data URI, i.e. the tool call itself failed and toolResult is the raw
++	// error text from ReadMediaService.executeTool - show it verbatim instead
++	// of the generic message, which used to hide the real reason.
++	const attachmentSaved = $derived(
++		section.toolResult ? ATTACHMENT_SAVED_REGEX.test(section.toolResult) : false
++	);
+ </script>
+ 
+ <ToolCallBlock {isStreaming} meta={readMediaMeta} {onToggle} {open} {section}>
+@@ -54,7 +62,7 @@
+ 		{#if section.toolResult}
+ 			{#if !mediaAttachment}
+ 				<div class="rounded bg-muted/20 p-2 text-xs text-muted-foreground/70 italic">
+-					Media attachment not found in message extras
++					{attachmentSaved ? 'Media attachment not found in message extras' : section.toolResult}
+ 				</div>
+ 			{:else if mediaAttachment.type === AttachmentType.AUDIO}
+ 				<div class="mt-2">
+diff --git a/tools/ui/src/lib/components/app/content/MarkdownContent/MarkdownContent.svelte b/tools/ui/src/lib/components/app/content/MarkdownContent/MarkdownContent.svelte
+index 87b41bd..ab154a9 100644
+--- a/tools/ui/src/lib/components/app/content/MarkdownContent/MarkdownContent.svelte
++++ b/tools/ui/src/lib/components/app/content/MarkdownContent/MarkdownContent.svelte
+@@ -1,6 +1,7 @@
+ <script lang="ts">
+ 	import '$lib/styles/katex-custom.scss';
+ 	import {
++		annotateCodeSaveTargets,
+ 		getCodeInfoFromTarget,
+ 		getHastNodeId,
+ 		getMdastNodeHash,
+@@ -43,6 +44,7 @@
+ 	import { BooleanString, ColorMode, UrlProtocol } from '$lib/enums';
+ 	import { FileTypeText } from '$lib/enums/files.enums';
+ 	import { createAutoScrollController } from '$lib/hooks/use-auto-scroll.svelte';
++	import { ToolsService } from '$lib/services/tools.service';
+ 	import { settingsStore } from '$lib/stores';
+ 	import type { DatabaseMessageExtra } from '$lib/types/database';
+ 	import {
+@@ -71,6 +73,7 @@
+ 	import remarkRehype from 'remark-rehype';
+ 	import { onDestroy, tick } from 'svelte';
+ 	import { SvelteMap } from 'svelte/reactivity';
++	import { toast } from 'svelte-sonner';
+ 
+ 	interface Props {
+ 		attachments?: DatabaseMessageExtra[];
+@@ -191,6 +194,7 @@
+ 
+ 		const copyButtons = containerRef.querySelectorAll<HTMLButtonElement>('.copy-code-btn');
+ 		const previewButtons = containerRef.querySelectorAll<HTMLButtonElement>('.preview-code-btn');
++		const saveButtons = containerRef.querySelectorAll<HTMLButtonElement>('.save-code-btn');
+ 
+ 		for (const button of copyButtons) {
+ 			button.removeEventListener('click', handleCopyClick);
+@@ -199,6 +203,10 @@
+ 		for (const button of previewButtons) {
+ 			button.removeEventListener('click', handlePreviewClick);
+ 		}
++
++		for (const button of saveButtons) {
++			button.removeEventListener('click', handleSaveClick);
++		}
+ 	}
+ 
+ 	/**
+@@ -295,6 +303,44 @@
+ 		}
+ 	}
+ 
++	/**
++	 * Handles click events on save buttons within code blocks that carry a
++	 * trailing file:// link. Writes the raw code straight through the
++	 * filesystem MCP tool - not an LLM-issued tool call, so a generation
++	 * that got cut off never turns into a broken write.
++	 * @param event - The click event from the save button
++	 */
++	async function handleSaveClick(event: Event) {
++		event.preventDefault();
++		event.stopPropagation();
++
++		const target = event.currentTarget as HTMLButtonElement | null;
++
++		if (!target) {
++			return;
++		}
++
++		const info = getCodeInfoFromTarget(target);
++
++		if (!info || !info.savePath) {
++			return;
++		}
++
++		try {
++			const result = await ToolsService.executeTool('write_file', {
++				content: info.rawCode,
++				path: info.savePath
++			});
++
++			if (result.isError) throw new Error(result.content);
++
++			toast.success(`Saved to ${info.savePath}`);
++		} catch (error) {
++			console.error('Failed to save code to file:', error);
++			toast.error('Failed to save file');
++		}
++	}
++
+ 	/**
+ 	 * Handles preview dialog open state changes.
+ 	 * Clears preview content when dialog is closed.
+@@ -372,6 +418,9 @@
+ 				const processorInstance = processor();
+ 				const ast = processorInstance.parse(normalizedPrefix) as MdastRoot;
+ 				const mdastChildren = (ast as { children?: unknown[] }).children ?? [];
++
++				annotateCodeSaveTargets(mdastChildren);
++
+ 				const nextBlocks: MarkdownBlock[] = [];
+ 				// Check if we're in append mode for cache reuse
+ 				const appendMode = isAppendMode(prefixMarkdown, previousContent);
+@@ -422,6 +471,9 @@
+ 		const processorInstance = processor();
+ 		const ast = processorInstance.parse(normalized) as MdastRoot;
+ 		const mdastChildren = (ast as { children?: unknown[] }).children ?? [];
++
++		annotateCodeSaveTargets(mdastChildren);
++
+ 		const stableCount = Math.max(mdastChildren.length - 1, 0);
+ 		const nextBlocks: MarkdownBlock[] = [];
+ 		// Check if we're in append mode for cache reuse
+@@ -483,6 +535,7 @@
+ 		for (const wrapper of wrappers) {
+ 			const copyButton = wrapper.querySelector<HTMLButtonElement>('.copy-code-btn');
+ 			const previewButton = wrapper.querySelector<HTMLButtonElement>('.preview-code-btn');
++			const saveButton = wrapper.querySelector<HTMLButtonElement>('.save-code-btn');
+ 
+ 			if (
+ 				copyButton &&
+@@ -499,6 +552,14 @@
+ 				previewButton.setAttribute(MARKDOWN_DATA_ATTRS.LISTENER_BOUND, BooleanString.TRUE);
+ 				previewButton.addEventListener('click', handlePreviewClick);
+ 			}
++
++			if (
++				saveButton &&
++				saveButton.getAttribute(MARKDOWN_DATA_ATTRS.LISTENER_BOUND) !== BooleanString.TRUE
++			) {
++				saveButton.setAttribute(MARKDOWN_DATA_ATTRS.LISTENER_BOUND, BooleanString.TRUE);
++				saveButton.addEventListener('click', handleSaveClick);
++			}
+ 		}
+ 	}
+ 
+diff --git a/tools/ui/src/lib/components/app/content/MarkdownContent/markdown-content.css b/tools/ui/src/lib/components/app/content/MarkdownContent/markdown-content.css
+index cada489..9799f4f 100644
+--- a/tools/ui/src/lib/components/app/content/MarkdownContent/markdown-content.css
++++ b/tools/ui/src/lib/components/app/content/MarkdownContent/markdown-content.css
+@@ -316,6 +316,7 @@ div.markdown-user-content :global(.table-wrapper) {
+ 
+ .markdown-content :global(.copy-code-btn),
+ .markdown-content :global(.preview-code-btn),
++.markdown-content :global(.save-code-btn),
+ .markdown-content :global(.toggle-source-btn) {
+ 	display: flex;
+ 	align-items: center;
+@@ -329,12 +330,14 @@ div.markdown-user-content :global(.table-wrapper) {
+ 
+ .markdown-content :global(.copy-code-btn:hover),
+ .markdown-content :global(.preview-code-btn:hover),
++.markdown-content :global(.save-code-btn:hover),
+ .markdown-content :global(.toggle-source-btn:hover) {
+ 	transform: scale(1.05);
+ }
+ 
+ .markdown-content :global(.copy-code-btn:active),
+ .markdown-content :global(.preview-code-btn:active),
++.markdown-content :global(.save-code-btn:active),
+ .markdown-content :global(.toggle-source-btn:active) {
+ 	transform: scale(0.95);
+ }
+diff --git a/tools/ui/src/lib/components/app/content/MarkdownContent/markdown-utils.ts b/tools/ui/src/lib/components/app/content/MarkdownContent/markdown-utils.ts
+index 9e2c0f4..4af2b5a 100644
+--- a/tools/ui/src/lib/components/app/content/MarkdownContent/markdown-utils.ts
++++ b/tools/ui/src/lib/components/app/content/MarkdownContent/markdown-utils.ts
+@@ -2,9 +2,25 @@
+  * Utility functions for markdown processing in MarkdownContent component.
+  */
+ 
+-import { MARKDOWN_DATA_ATTRS } from '$lib/constants';
++import { FILE_URI_PREFIX, MARKDOWN_DATA_ATTRS } from '$lib/constants';
++import { decodeFileLinkPath } from '$lib/utils';
+ import type { RootContent as HastRootContent } from 'hast';
+ 
++interface MdastCodeNode {
++	type?: string;
++	data?: { hProperties?: Record<string, string> };
++}
++
++interface MdastLinkNode {
++	type?: string;
++	url?: string;
++}
++
++interface MdastParagraphNode {
++	type?: string;
++	children?: unknown[];
++}
++
+ /**
+  * Generates a unique identifier for a HAST node based on its position.
+  * Used for stable block identification during incremental rendering.
+@@ -51,9 +67,45 @@ export function isAppendMode(newContent: string, previousContent: string): boole
+ 	return previousContent.length > 0 && newContent.startsWith(previousContent);
+ }
+ 
++/**
++ * Marks fenced code blocks immediately followed by a `file://` link with the
++ * decoded path, via mdast's `data.hProperties` convention (copied onto the
++ * matching hast element by remark-rehype). Must run on the full top-level
++ * mdast children array, right after parsing - individual blocks are later
++ * transformed one at a time in isolation for caching, where no sibling is
++ * visible, so this is the only point where a real "next sibling" exists.
++ */
++export function annotateCodeSaveTargets(children: unknown[]): void {
++	for (let i = 0; i < children.length - 1; i++) {
++		const node = children[i] as MdastCodeNode;
++
++		if (node.type !== 'code') continue;
++
++		const next = children[i + 1] as MdastParagraphNode;
++
++		if (next.type !== 'paragraph' || !Array.isArray(next.children)) continue;
++
++		const link = next.children.find(
++			(child): child is MdastLinkNode =>
++				typeof child === 'object' && child !== null && (child as MdastLinkNode).type === 'link'
++		);
++
++		if (!link?.url || !link.url.startsWith(FILE_URI_PREFIX)) continue;
++
++		const savePath = decodeFileLinkPath(link.url.slice(FILE_URI_PREFIX.length));
++
++		node.data = {
++			...node.data,
++			hProperties: { ...node.data?.hProperties, [MARKDOWN_DATA_ATTRS.SAVE_PATH]: savePath }
++		};
++	}
++}
++
+ export interface CodeInfo {
+ 	rawCode: string;
+ 	language: string;
++	/** Absolute path the code block should be written to, if it carried a trailing file:// link. */
++	savePath: string | null;
+ }
+ 
+ /**
+@@ -81,6 +133,7 @@ export function getCodeInfoFromTarget(target: HTMLElement): CodeInfo | null {
+ 	const rawCode = codeElement.textContent ?? '';
+ 	const languageLabel = wrapper.querySelector<HTMLElement>('.code-language');
+ 	const language = languageLabel?.textContent?.trim() || 'text';
++	const savePath = wrapper.getAttribute(MARKDOWN_DATA_ATTRS.SAVE_PATH);
+ 
+-	return { language, rawCode };
++	return { language, rawCode, savePath };
+ }
+diff --git a/tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/code-block-utils.ts b/tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/code-block-utils.ts
+index 4eb38e4..065a3ba 100644
+--- a/tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/code-block-utils.ts
++++ b/tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/code-block-utils.ts
+@@ -9,6 +9,7 @@ import {
+ 	COPY_ICON_SVG,
+ 	DIAGRAM_SOURCE_CLASS,
+ 	PREVIEW_ICON_SVG,
++	SAVE_ICON_SVG,
+ 	TOGGLE_SOURCE_BTN_CLASS
+ } from '$lib/constants';
+ import type { Element, ElementContent } from 'hast';
+@@ -73,6 +74,14 @@ export function createPreviewButton(
+ 	return createButton(CODE_BLOCK_CLASS.PREVIEW_BTN, title, PREVIEW_ICON_SVG, id, idAttribute);
+ }
+ 
++/**
++ * Creates a save-to-file button element. The target path travels separately
++ * on the wrapper's `data-save-path` attribute, set by the caller.
++ */
++export function createSaveButton(id: string, idAttribute: string, title: string = 'Save to file'): Element {
++	return createButton(CODE_BLOCK_CLASS.SAVE_BTN, title, SAVE_ICON_SVG, id, idAttribute);
++}
++
+ /**
+  * Creates a button that toggles a diagram block between its rendered view and
+  * its source view. aria-pressed starts false, the rendered view is the default.
+diff --git a/tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/enhance-code-blocks.ts b/tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/enhance-code-blocks.ts
+index f42ab1c..43acb19 100644
+--- a/tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/enhance-code-blocks.ts
++++ b/tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/enhance-code-blocks.ts
+@@ -14,6 +14,7 @@ import {
+ 	createBlockHeader,
+ 	createCopyButton,
+ 	createPreviewButton,
++	createSaveButton,
+ 	createWrapper,
+ 	generateBlockId
+ } from './code-block-utils';
+@@ -28,6 +29,23 @@ declare global {
+ 	}
+ }
+ 
++/**
++ * Reads the save path annotated by `annotateCodeSaveTargets` (markdown-utils.ts).
++ * That step runs on the full mdast tree, before per-block isolation, and
++ * stores the path via mdast's `data.hProperties` convention - remark-rehype
++ * copies it onto either the `pre` or its `code` child depending on node
++ * shape, so both are checked here.
++ */
++function extractSavePath(preElement: Element, codeElement: Element): string | null {
++	const fromPre = preElement.properties?.[MARKDOWN_DATA_ATTRS.SAVE_PATH];
++
++	if (typeof fromPre === 'string') return fromPre;
++
++	const fromCode = codeElement.properties?.[MARKDOWN_DATA_ATTRS.SAVE_PATH];
++
++	return typeof fromCode === 'string' ? fromCode : null;
++}
++
+ function extractLanguage(codeElement: Element): string {
+ 	const className = codeElement.properties?.className;
+ 
+@@ -76,12 +94,19 @@ export const rehypeEnhanceCodeBlocks: Plugin<[], Root> = () => {
+ 				actions.push(createPreviewButton(codeId, MARKDOWN_DATA_ATTRS.CODE_ID, 'Preview code'));
+ 			}
+ 
++			const savePath = extractSavePath(node, codeElement);
++
++			if (savePath) {
++				actions.push(createSaveButton(codeId, MARKDOWN_DATA_ATTRS.CODE_ID, 'Save to file'));
++			}
++
+ 			const header = createBlockHeader(language, codeId, MARKDOWN_DATA_ATTRS.CODE_ID, actions);
+ 			const wrapper = createWrapper(
+ 				header,
+ 				node,
+ 				CODE_BLOCK_CLASS.WRAPPER,
+-				CODE_BLOCK_CLASS.SCROLL_CONTAINER
++				CODE_BLOCK_CLASS.SCROLL_CONTAINER,
++				savePath ? { [MARKDOWN_DATA_ATTRS.SAVE_PATH]: savePath } : undefined
+ 			);
+ 
+ 			// Replace pre with wrapper in parent
+diff --git a/tools/ui/src/lib/constants/code-block.constants.ts b/tools/ui/src/lib/constants/code-block.constants.ts
+index 05db575..77edf5e 100644
+--- a/tools/ui/src/lib/constants/code-block.constants.ts
++++ b/tools/ui/src/lib/constants/code-block.constants.ts
+@@ -45,6 +45,7 @@ export const CODE_BLOCK_CLASS = {
+ 	LANGUAGE: 'code-language',
+ 	PREVIEW_BTN: 'preview-code-btn',
+ 	RELATIVE: 'relative',
++	SAVE_BTN: 'save-code-btn',
+ 	SCROLL_CONTAINER: 'code-block-scroll-container',
+ 	WRAPPER: 'code-block-wrapper'
+ } as const;
+diff --git a/tools/ui/src/lib/constants/icons.constants.ts b/tools/ui/src/lib/constants/icons.constants.ts
+index a0ce22f..ce02c7f 100644
+--- a/tools/ui/src/lib/constants/icons.constants.ts
++++ b/tools/ui/src/lib/constants/icons.constants.ts
+@@ -67,3 +67,5 @@ export const COPY_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="16"
+ export const PREVIEW_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-eye lucide-eye-icon"><path d="M2.062 12.345a1 1 0 0 1 0-.69C3.5 7.73 7.36 5 12 5s8.5 2.73 9.938 6.655a1 1 0 0 1 0 .69C20.5 16.27 16.64 19 12 19s-8.5-2.73-9.938-6.655"/><circle cx="12" cy="12" r="3"/></svg>`;
+ 
+ export const CODE_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-code lucide-code-icon"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>`;
++
++export const SAVE_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-save lucide-save-icon"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></svg>`;
+diff --git a/tools/ui/src/lib/constants/markdown.constants.ts b/tools/ui/src/lib/constants/markdown.constants.ts
+index 298a2f1..42cc8a4 100644
+--- a/tools/ui/src/lib/constants/markdown.constants.ts
++++ b/tools/ui/src/lib/constants/markdown.constants.ts
+@@ -7,7 +7,8 @@ export const MARKDOWN_DATA_ATTRS = {
+ 	ERROR_BOUND: 'data-error-bound',
+ 	ERROR_HANDLED: 'data-error-handled',
+ 	LISTENER_BOUND: 'data-listener-bound',
+-	ORIGINAL_SRC: 'data-original-src'
++	ORIGINAL_SRC: 'data-original-src',
++	SAVE_PATH: 'data-save-path'
+ } as const;
+ 
+ /** Markdown structural markers used by `looksLikeMarkdown`. Inline / line-level. */
+diff --git a/tools/ui/src/lib/constants/settings.constants.ts b/tools/ui/src/lib/constants/settings.constants.ts
+index 7140bbc..df2d340 100644
+--- a/tools/ui/src/lib/constants/settings.constants.ts
++++ b/tools/ui/src/lib/constants/settings.constants.ts
+@@ -82,7 +82,16 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
+ 				type: SettingsFieldType.INPUT
+ 			},
+ 			{
+-				defaultValue: '',
++				defaultValue:
++					'When asked to produce a whole file (e.g. a full HTML page), do not call ' +
++					'write_file with the content as the tool argument - a token limit cutting off ' +
++					'mid-argument breaks the JSON and cannot be recovered by continuing. Instead, ' +
++					'write the entire file as one fenced code block in your normal reply, then on ' +
++					'its own line right after the closing fence add a markdown link to the ' +
++					'absolute save path using the file:// scheme, for example ' +
++					'[dashboard.html](file:///home/user/project/dashboard.html). If you run out ' +
++					'of tokens partway through, continue the same code block in your next reply - ' +
++					'do not restart it or wrap it in a tool call.',
+ 				help: 'The starting message that defines how model should behave.',
+ 				key: SETTINGS_KEYS.SYSTEM_MESSAGE,
+ 				label: 'System Message',
+diff --git a/tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts b/tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts
+index 30261f7..6442cc9 100644
+--- a/tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts
++++ b/tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts
+@@ -7,9 +7,36 @@
+  * as reactive getters so validation tracks the model in real time.
+  */
+ 
+-import { filterFilesByModalities, isFileTypeSupported } from '$lib/utils';
++import { FileTypeCategory } from '$lib/enums';
++import { pendingImagePathStore } from '$lib/stores';
++import { filterFilesByModalities, getFileTypeCategory, isFileTypeSupported } from '$lib/utils';
+ import { processFilesToChatUploaded } from '$lib/utils/browser-only';
+ 
++// The panel backend (see panel/backend/server.py, upload_image()) - separate
++// process from the router, not proxied through it.
++const IMAGE_UPLOAD_URL = 'http://127.0.0.1:9010/api/upload-image';
++
++// A model with no vision support still can't attach the image inline, but a
++// filesystem/vision-analysis tool can read it from disk - save it there and
++// hand the model a path instead of hard-blocking the paste/drop.
++async function saveImageForPathInsertion(file: File): Promise<void> {
++	const body = new FormData();
++
++	body.set('file', file);
++
++	try {
++		const res = await fetch(IMAGE_UPLOAD_URL, { body, method: 'POST' });
++
++		if (!res.ok) return;
++
++		const { path } = (await res.json()) as { path?: string };
++
++		if (path) pendingImagePathStore.push(path);
++	} catch {
++		// panel backend unreachable - the file just stays unattached, no crash
++	}
++}
++
+ interface UseChatScreenFileUploadOptions {
+ 	capabilities: () => { hasVision: boolean; hasAudio: boolean; hasVideo: boolean };
+ 	activeModelId: () => string | null | undefined;
+@@ -48,7 +75,19 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
+ 			generallySupported,
+ 			options.capabilities()
+ 		);
+-		const allUnsupportedFiles = [...generallyUnsupported, ...unsupportedFiles];
++
++		const imagesNeedingFallback = unsupportedFiles.filter(
++			(file) => getFileTypeCategory(file.type) === FileTypeCategory.IMAGE
++		);
++
++		if (imagesNeedingFallback.length > 0) {
++			await Promise.all(imagesNeedingFallback.map(saveImageForPathInsertion));
++		}
++
++		const stillUnsupported = unsupportedFiles.filter(
++			(file) => !imagesNeedingFallback.includes(file)
++		);
++		const allUnsupportedFiles = [...generallyUnsupported, ...stillUnsupported];
+ 
+ 		if (allUnsupportedFiles.length > 0) {
+ 			const supportedTypes: string[] = ['text files', 'PDFs'];
+@@ -63,7 +102,7 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
+ 			fileErrorData = {
+ 				generallyUnsupported,
+ 				modalityReasons,
+-				modalityUnsupported: unsupportedFiles,
++				modalityUnsupported: stillUnsupported,
+ 				supportedTypes
+ 			};
+ 			showFileErrorDialog = true;
+diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
+index b008b16..0f1db33 100644
+--- a/tools/ui/src/lib/services/chat.service.ts
++++ b/tools/ui/src/lib/services/chat.service.ts
+@@ -404,6 +404,43 @@ export class ChatService {
+ 		return titleResponse;
+ 	}
+ 
++	/**
++	 * Ask the model to summarize a transcript, for conversation compaction.
++	 * Same fire-and-forget shape as generateTitle: an ad-hoc single message,
++	 * never touching the conversation's own message tree, so a failure or
++	 * cancel leaves the real history completely untouched.
++	 *
++	 * Deliberately does NOT catch-and-swallow: sendMessage already throws a
++	 * real, user-facing Error (context length exceeded, connection refused,
++	 * etc.) - generateTitle's own catch-and-return-'' pattern was tried here
++	 * first and it made every failure look identical ("did not return a
++	 * summary"), with the actual reason logged nowhere. Let the caller
++	 * (chatStore.compactConversation) catch it and surface error.message.
++	 */
++	static async generateSummary(
++		prompt: string,
++		model?: string | null,
++		signal?: AbortSignal
++	): Promise<string> {
++		let summary = '';
++
++		await ChatService.sendMessage(
++			[{ content: prompt, role: MessageRole.USER }],
++			{
++				custom: { chat_template_kwargs: { enable_thinking: false } },
++				model: model || undefined,
++				onChunk: (chunk: string) => {
++					summary += chunk;
++				},
++				stream: true
++			},
++			undefined,
++			signal
++		);
++
++		return summary;
++	}
++
+ 	static getStreamState(conversationId: string): ResumableStreamState | null {
+ 		if (!conversationId) return null;
+ 
+@@ -715,7 +752,23 @@ export class ChatService {
+ 
+ 				if (!resumeResp || resumeResp.status !== 200) {
+ 					onConnectionState?.(StreamConnectionState.LOST);
+-					onError?.(new Error('Stream connection lost and could not be resumed'));
++
++					// the server's own reason (e.g. "not found or expired" vs a
++					// remote model's "doesn't support resuming") is more useful
++					// than this generic fallback — read it when there is one
++					let detail = '';
++
++					if (resumeResp) {
++						try {
++							const body = await resumeResp.json();
++
++							if (body?.error?.message) detail = `: ${body.error.message}`;
++						} catch {
++							// no JSON body to read, keep the generic message
++						}
++					}
++
++					onError?.(new Error(`Stream connection lost and could not be resumed${detail}`));
+ 
+ 					break;
+ 				}
+diff --git a/tools/ui/src/lib/services/read-media.service.ts b/tools/ui/src/lib/services/read-media.service.ts
+index 2858795..03ec633 100644
+--- a/tools/ui/src/lib/services/read-media.service.ts
++++ b/tools/ui/src/lib/services/read-media.service.ts
+@@ -81,9 +81,15 @@ export class ReadMediaService {
+ 				imageMime || audioMime
+ 					? `the current model cannot perceive ".${extension}" files`
+ 					: `".${extension}" is not a supported media type`;
++			// a capability mismatch (not a missing-support case) has a real way
++			// out - point at the MCP vision tool instead of leaving a dead end
++			const hint =
++				imageMime || audioMime
++					? ' If a vision_ocr or vision_inspect tool is available, call that instead to analyze the file.'
++					: '';
+ 
+ 			return {
+-				content: `Error: ${reason}. Supported: ${supported.join(', ')}.`,
++				content: `Error: ${reason}. Supported: ${supported.join(', ')}.${hint}`,
+ 				isError: true
+ 			};
+ 		}
+diff --git a/tools/ui/src/lib/stores/chat/index.svelte.ts b/tools/ui/src/lib/stores/chat/index.svelte.ts
+index 296c2cc..453990e 100644
+--- a/tools/ui/src/lib/stores/chat/index.svelte.ts
++++ b/tools/ui/src/lib/stores/chat/index.svelte.ts
+@@ -9,7 +9,16 @@
+  * Uses ChatService for the API layer and conversationsStore for persistence.
+  */
+ 
+-import { CWD_CLEARED_TEXT, SYSTEM_MESSAGE_PLACEHOLDER, TITLE_GENERATION } from '$lib/constants';
++import {
++	COMBINE_SUMMARIES_PROMPT,
++	COMPACTION_CHARS_PER_CONTEXT_TOKEN,
++	CWD_CLEARED_TEXT,
++	DEFAULT_COMPACTION_CONTEXT_TOKENS,
++	DEFAULT_COMPACTION_PROMPT,
++	MIN_MESSAGES_FOR_COMPACTION,
++	SYSTEM_MESSAGE_PLACEHOLDER,
++	TITLE_GENERATION
++} from '$lib/constants';
+ import {
+ 	ErrorDialogType,
+ 	MessageRole,
+@@ -42,6 +51,7 @@ import type {
+ } from '$lib/types';
+ import {
+ 	findMessageById,
++	formatCompactionMessage,
+ 	formatCwdMessage,
+ 	getConversationModel,
+ 	isAbortError,
+@@ -120,7 +130,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 		type: MessageType = MessageType.TEXT,
+ 		parent: string = '-1',
+ 		extras?: DatabaseMessageExtra[],
+-		isSynthetic?: boolean
++		isSynthetic?: boolean,
++		compactionStats?: { originalChars: number; summaryChars: number }
+ 	): Promise<DatabaseMessage> {
+ 		const activeConv = conversationsStore.activeConversation;
+ 
+@@ -143,6 +154,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 		const message = await DatabaseService.createMessageBranch(
+ 			{
+ 				children: [],
++				compactionStats,
+ 				content,
+ 				convId: activeConv.id,
+ 				extra: extras,
+@@ -277,6 +289,176 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 		this.currentResponse = '';
+ 	}
+ 
++	/**
++	 * Summarizes a list of "Role: content" turn strings. A conversation that
++	 * has already filled its context is exactly the case that most needs
++	 * compacting and least affords resending the whole transcript in one
++	 * call - there is no room left for both the transcript AND the summary
++	 * it needs to produce. So turns are batched to a safe character budget
++	 * (see COMPACTION_CHARS_PER_CONTEXT_TOKEN's doc), each batch summarized
++	 * on its own, and - only when there was more than one batch - those
++	 * partial summaries combined into a final one. A conversation that fits
++	 * in a single call skips the reduce step entirely.
++	 */
++	private async summarizeTranscript(
++		turns: string[],
++		effectiveModel: string | undefined
++	): Promise<string> {
++		const contextTokens =
++			modelsStore.props.getModelContextSize(effectiveModel ?? modelsStore.activeModelId ?? '') ??
++			DEFAULT_COMPACTION_CONTEXT_TOKENS;
++		const charBudget = contextTokens * COMPACTION_CHARS_PER_CONTEXT_TOKEN;
++
++		const batches: string[][] = [];
++		let current: string[] = [];
++		let currentLen = 0;
++
++		for (const turn of turns) {
++			if (current.length > 0 && currentLen + turn.length > charBudget) {
++				batches.push(current);
++				current = [];
++				currentLen = 0;
++			}
++
++			current.push(turn);
++			currentLen += turn.length + 2;
++		}
++
++		if (current.length > 0) batches.push(current);
++
++		if (batches.length <= 1) {
++			const transcript = (batches[0] ?? turns).join('\n\n');
++
++			return ChatService.generateSummary(
++				DEFAULT_COMPACTION_PROMPT.replace('{{TRANSCRIPT}}', transcript),
++				effectiveModel
++			);
++		}
++
++		const partials: string[] = [];
++
++		for (const [i, batch] of batches.entries()) {
++			const transcript = batch.join('\n\n');
++
++			try {
++				const partial = await ChatService.generateSummary(
++					DEFAULT_COMPACTION_PROMPT.replace('{{TRANSCRIPT}}', transcript),
++					effectiveModel
++				);
++
++				if (partial.trim()) partials.push(partial.trim());
++			} catch (error) {
++				// one bad batch (a transient network blip, say) should not sink
++				// the whole compaction when the others are fine - surfaced only
++				// if every batch ends up failing, below
++				console.error(`[compaction] batch ${i + 1}/${batches.length} failed:`, error);
++			}
++		}
++
++		if (partials.length === 0) {
++			throw new Error('Every batch failed to summarize - see console for details');
++		}
++
++		// the reduce call itself can fail the same way a batch can (rare,
++		// since partials are far shorter than the original transcript) - fall
++		// back to concatenating the parts rather than losing them entirely
++		try {
++			const combined = partials.map((p, i) => `Part ${i + 1}: ${p}`).join('\n\n');
++			const finalSummary = await ChatService.generateSummary(
++				COMBINE_SUMMARIES_PROMPT.replace('{{PARTIAL_SUMMARIES}}', combined),
++				effectiveModel
++			);
++
++			return finalSummary.trim() || partials.join('\n\n');
++		} catch (error) {
++			console.error('[compaction] combining partial summaries failed:', error);
++
++			return partials.join('\n\n');
++		}
++	}
++
++	/**
++	 * Summarizes the active conversation and stores the summary as a normal
++	 * synthetic message (see formatCompactionMessage), then points the
++	 * conversation's compactedThroughMessageId at it - streamChatCompletion's
++	 * trim at the top of that function is what actually shrinks future
++	 * requests. Nothing is deleted: every original message stays in
++	 * IndexedDB and stays visible in the transcript.
++	 *
++	 * Compacting an already-compacted conversation works the same way - the
++	 * prior summary message is just another USER-role turn in
++	 * activeMessages, so it naturally folds into the new summary rather than
++	 * needing special-casing.
++	 */
++	async compactConversation(): Promise<{ ok: boolean; error?: string }> {
++		const activeConv = conversationsStore.activeConversation;
++
++		if (!activeConv) return { error: 'No active conversation', ok: false };
++
++		// Tool/system messages are left out of the transcript: the assistant's
++		// own replies already narrate what a tool call found, and raw tool
++		// JSON/output is verbose and not well suited to being re-summarized.
++		const messages = conversationsStore.activeMessages.filter(
++			(m) => m.role === MessageRole.USER || m.role === MessageRole.ASSISTANT
++		);
++
++		if (messages.length < MIN_MESSAGES_FOR_COMPACTION) {
++			return { error: 'Conversation is too short to compact', ok: false };
++		}
++
++		const turns = messages.map(
++			(m) => `${m.role === MessageRole.USER ? 'User' : 'Assistant'}: ${m.content}`
++		);
++		// Same 3-tier fallback streamChatCompletion itself uses (see its own
++		// effectiveModel resolution) - selectedModelName alone is only set
++		// once the user has freshly picked a model from the dropdown in this
++		// browser session; an existing conversation resumed without doing
++		// that has no selectedModelName, and router mode then rejects the
++		// request outright for missing a model field. getConversationModel
++		// recovers it from the conversation's own message history instead.
++		const effectiveModel = serverStore.isRouterMode
++			? (modelsStore.selectedModelName ?? getConversationModel(messages) ?? undefined)
++			: undefined;
++
++		let summary: string;
++
++		try {
++			summary = await this.summarizeTranscript(turns, effectiveModel);
++		} catch (error) {
++			// surface the real reason (context length exceeded, connection
++			// refused, etc.) instead of a one-size-fits-all message - see
++			// ChatService.generateSummary's own note on why it no longer
++			// swallows this
++			return {
++				error: error instanceof Error ? error.message : 'Failed to generate a summary',
++				ok: false
++			};
++		}
++
++		if (!summary.trim()) {
++			return { error: 'The model returned an empty summary', ok: false };
++		}
++
++		const trimmedSummary = summary.trim();
++		// turns.join, not a per-turn sum, so this matches summarizeTranscript's
++		// own batching math exactly (it batches on the same joined length).
++		const compactionStats = { originalChars: turns.join('\n\n').length, summaryChars: trimmedSummary.length };
++
++		const summaryMessage = await this.addMessage(
++			MessageRole.USER,
++			formatCompactionMessage(trimmedSummary),
++			MessageType.TEXT,
++			'-1',
++			undefined,
++			true,
++			compactionStats
++		);
++
++		await conversationsStore.setCompactionPoint(activeConv.id, summaryMessage.id);
++
++		return { ok: true };
++	}
++
+ 	consumePendingDraft(): { message: string; files: ChatUploadedFile[] } | null {
+ 		if (!this.pendingDraftMessage && this.pendingDraftFiles.length === 0) return null;
+ 
+@@ -814,14 +996,39 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 		modelOverride?: string | null,
+ 		firstUserMessageContent?: string
+ 	): Promise<void> {
++		// Resolved from the FULL history before any trim below: the summary
++		// message a compacted conversation gets sliced down to is role: USER,
++		// so a trimmed array can easily contain no assistant message at all
++		// (and therefore no .model field) until the next reply arrives -
++		// getConversationModel(allMessages) would then return null and the
++		// request would go out with no model, which router mode rejects
++		// outright ("model name is missing from the request"). The
++		// conversation's own model identity does not change just because
++		// less history is being sent, so this must read the untrimmed array.
++		const conversationModel = getConversationModel(allMessages);
++
++		// If this conversation has been compacted, only send the summary message
++		// onward plus whatever came after it - the original messages stay in
++		// IndexedDB untouched, just excluded from the outgoing request. Every
++		// send path (fresh message, edit/regenerate, agentic) funnels through
++		// here with the full active-path array, so this one slice covers all
++		// of them. Guarded against a stale pointer (e.g. after navigating to a
++		// sibling branch that diverged before the compaction point) by
++		// requiring the id to actually be present in this call's allMessages.
++		const compactedThroughId = conversationsStore.activeConversation?.compactedThroughMessageId;
++
++		if (compactedThroughId) {
++			const idx = allMessages.findIndex((m) => m.id === compactedThroughId);
++
++			if (idx !== -1) allMessages = allMessages.slice(idx);
++		}
++
+ 		// the ::model suffix in the stream identity is only for router mode, where it routes to the
+ 		// owning child. in single-model mode the identity stays the bare conv id so that attach, stop
+ 		// and reattach all agree, regardless of fresh send vs regenerate passing a resolved model
+ 		let effectiveModel: string | null | undefined = undefined;
+ 
+ 		if (serverStore.isRouterMode) {
+-			const conversationModel = getConversationModel(allMessages);
+-
+ 			effectiveModel = modelOverride || modelsStore.selectedModelName || conversationModel;
+ 		}
+ 
+@@ -932,6 +1139,17 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 				extras?: DatabaseMessageExtra[],
+ 				toolCwd?: string
+ 			) => {
++				// Parent to the last-created message in this flow, not the
++				// turn's assistant message: a turn with 2+ tool calls creates
++				// one tool-result message per call, and each must chain onto
++				// the previous result (A -> T1 -> T2) rather than all forking
++				// off A as siblings (A -> {T1, T2}). The sibling shape made
++				// filterByLeafNodeId's single-parent walk (used by Continue,
++				// conversation reload, and regenerate) drop every result but
++				// the last when reconstructing history from the persisted
++				// tree, producing a tool_calls entry with no matching
++				// tool_call_id message — invalid enough that stricter
++				// backends (e.g. some OpenRouter providers) reject it outright.
+ 				const msg = await DatabaseService.createMessageBranch(
+ 					{
+ 						children: [],
+@@ -945,7 +1163,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 						toolCwd,
+ 						type: MessageType.TEXT
+ 					},
+-					currentMessageId
++					lastCreatedInFlow
+ 				);
+ 
+ 				// mirror into the active store and move the node pointer only when this
+diff --git a/tools/ui/src/lib/stores/conversations/index.svelte.ts b/tools/ui/src/lib/stores/conversations/index.svelte.ts
+index f2082eb..e5e5cc6 100644
+--- a/tools/ui/src/lib/stores/conversations/index.svelte.ts
++++ b/tools/ui/src/lib/stores/conversations/index.svelte.ts
+@@ -671,6 +671,22 @@ class ConversationsStore implements ConversationsPreferencesHost {
+ 		}
+ 	}
+ 
++	/**
++	 * Marks the message streamChatCompletion trims outgoing requests to (see
++	 * its compactedThroughMessageId read at the top of the function). Never
++	 * deletes anything - messageId undefined just clears the pointer so the
++	 * full history is sent again.
++	 */
++	async setCompactionPoint(convId: string, messageId: string | undefined): Promise<void> {
++		try {
++			await DatabaseService.updateConversation(convId, { compactedThroughMessageId: messageId });
++
++			this.applyConversationUpdate(convId, { compactedThroughMessageId: messageId });
++		} catch (error) {
++			console.error('Failed to set compaction point:', error);
++		}
++	}
++
+ 	/**
+ 	 * Marks a conversation as recently active: stamps lastModified (persisted)
+ 	 * and moves it to the top of the list. Only message-activity flows call
+diff --git a/tools/ui/src/lib/stores/index.ts b/tools/ui/src/lib/stores/index.ts
+index b571699..fd629f5 100644
+--- a/tools/ui/src/lib/stores/index.ts
++++ b/tools/ui/src/lib/stores/index.ts
+@@ -51,6 +51,8 @@ export { settingsStore } from './settings/index.svelte';
+ 
+ export { permissionsStore } from './permissions.svelte';
+ 
++export { pendingImagePathStore } from './pending-image-path.svelte';
++
+ // TOOLS
+ export { toolsStore } from './tools.svelte';
+ 
+diff --git a/tools/ui/src/lib/stores/pending-image-path.svelte.ts b/tools/ui/src/lib/stores/pending-image-path.svelte.ts
+new file mode 100644
+index 0000000..39ef061
+--- /dev/null
++++ b/tools/ui/src/lib/stores/pending-image-path.svelte.ts
+@@ -0,0 +1,33 @@
++/**
++ * pendingImagePathStore - Bridges the file-upload hook to the message input
++ *
++ * An image pasted/dropped while the active model has no vision support gets
++ * saved to disk instead of attached (see use-chat-screen-file-upload), so a
++ * text-only model can still reach it through a filesystem-reading tool. The
++ * hook (owned by ChatScreen) and the message textarea (owned by ChatForm)
++ * have no direct line to each other, so the resulting path travels through
++ * this small shared store rather than threading a new callback prop through
++ * the components in between.
++ */
++
++class PendingImagePathStore {
++	private _path = $state('');
++
++	get path(): string {
++		return this._path;
++	}
++
++	push(path: string): void {
++		this._path = this._path ? `${this._path} ${path}` : path;
++	}
++
++	consume(): string {
++		const path = this._path;
++
++		this._path = '';
++
++		return path;
++	}
++}
++
++export const pendingImagePathStore = new PendingImagePathStore();
+diff --git a/tools/ui/src/lib/types/database.d.ts b/tools/ui/src/lib/types/database.d.ts
+index 57b77f0..5b04f12 100644
+--- a/tools/ui/src/lib/types/database.d.ts
++++ b/tools/ui/src/lib/types/database.d.ts
+@@ -27,6 +27,11 @@ export interface DatabaseConversation {
+ 	disabledToolCategories?: ToolSource[];
+ 	forkedFromConversationId?: string;
+ 	pinned?: boolean;
++	/** Id of the synthetic compaction-summary message (see chat.enums.ts's
++	 *  COMPACTION_SUMMARY_MARKER) that streamChatCompletion trims the request
++	 *  to when present - everything before it is still stored, just not
++	 *  resent to the model. Never a destructive delete. */
++	compactedThroughMessageId?: string;
+ }
+ 
+ export interface DatabaseMessageExtraAudioFile {
+@@ -134,6 +139,8 @@ export interface DatabaseMessage {
+ 	toolCwd?: string;
+ 	/** Internal flag marking a UI-generated message (e.g. a cwd change). The row is sent to the model as a "user" turn so chat templates accept it; the flag is only read by the renderer. */
+ 	isSynthetic?: boolean;
++	/** Set only on a compaction-summary message: sizes (chars) of the original transcript vs. the summary that replaced it, for the UI's "reduced from X to Y" line. Never sent to the model - display-only. */
++	compactionStats?: { originalChars: number; summaryChars: number };
+ 	children: string[];
+ 	extra?: DatabaseMessageExtra[];
+ 	timings?: ChatMessageTimings;
+diff --git a/tools/ui/src/lib/utils/compaction.ts b/tools/ui/src/lib/utils/compaction.ts
+new file mode 100644
+index 0000000..b471bb8
+--- /dev/null
++++ b/tools/ui/src/lib/utils/compaction.ts
+@@ -0,0 +1,36 @@
++import { COMPACTION_SUMMARY_PREFIX, DISPLAY_CHARS_PER_TOKEN_ESTIMATE } from '$lib/constants';
++
++/**
++ * Format a synthetic compaction-summary message. Same shape as
++ * formatCwdMessage in path-display.ts: a fixed prefix the UI parses back out
++ * to render a dedicated chip, with the model-facing text following it.
++ */
++export function formatCompactionMessage(summary: string): string {
++	return COMPACTION_SUMMARY_PREFIX + summary;
++}
++
++/**
++ * Parse a synthetic compaction message back into just the summary text.
++ * The caller must already know the message is synthetic (via the persisted
++ * `isSynthetic` flag); this only extracts the payload.
++ */
++export function parseCompactionMessage(content: string): string | null {
++	if (!content.startsWith(COMPACTION_SUMMARY_PREFIX)) return null;
++
++	return content.slice(COMPACTION_SUMMARY_PREFIX.length);
++}
++
++/**
++ * Turns a compaction message's stored char counts into the UI's "reduced
++ * from X to Y tokens" line. Token counts are estimated (see
++ * DISPLAY_CHARS_PER_TOKEN_ESTIMATE) since the actual tokenizer isn't
++ * available client-side - good enough for a rough sense of the win, not
++ * meant to be exact.
++ */
++export function formatCompactionStats(stats: { originalChars: number; summaryChars: number }): string {
++	const before = Math.max(1, Math.round(stats.originalChars / DISPLAY_CHARS_PER_TOKEN_ESTIMATE));
++	const after = Math.max(1, Math.round(stats.summaryChars / DISPLAY_CHARS_PER_TOKEN_ESTIMATE));
++	const reduction = Math.round((1 - after / before) * 100);
++
++	return `~${before.toLocaleString()} → ~${after.toLocaleString()} tokens (${reduction}% smaller)`;
++}
+diff --git a/tools/ui/src/lib/utils/index.ts b/tools/ui/src/lib/utils/index.ts
+index 079cdc8..688035d 100644
+--- a/tools/ui/src/lib/utils/index.ts
++++ b/tools/ui/src/lib/utils/index.ts
+@@ -171,6 +171,9 @@ export { createBase64DataUrl } from './data-url';
+ // Header utilities
+ export { parseHeadersToArray, serializeHeaders } from './headers';
+ 
++// Conversation compaction message helpers
++export { formatCompactionMessage, formatCompactionStats, parseCompactionMessage } from './compaction';
++
+ // Working-directory display helpers (HOME-style tilde abbreviation)
+ export {
+ 	abbreviateWorkingDir,
+diff --git a/tools/ui/src/routes/+layout.svelte b/tools/ui/src/routes/+layout.svelte
+index 38b6562..57a398f 100644
+--- a/tools/ui/src/routes/+layout.svelte
++++ b/tools/ui/src/routes/+layout.svelte
+@@ -5,6 +5,8 @@
+ 	import { base } from '$app/paths';
+ 	import { page } from '$app/state';
+ 	import { SidebarNavigation } from '$lib/components/app';
++	import { PanelRightClose, PanelRightOpen } from '@lucide/svelte';
++	import RightBar from '@mcp-panel/RightBar.svelte';
+ 	import { PwaMetaTags, PwaRefreshAlert } from '$lib/components/pwa';
+ 	import * as Tooltip from '$lib/components/ui/tooltip';
+ 	import {
+@@ -328,6 +330,8 @@
+ 		<div class="flex-1">
+ 			{@render children?.()}
+ 		</div>
++
++		<RightBar iconOpen={PanelRightOpen} iconClose={PanelRightClose} />
+ 	</div>
+ 
+ 	<ModeWatcher />
+diff --git a/tools/ui/src/routes/nim/+page.svelte b/tools/ui/src/routes/nim/+page.svelte
+new file mode 100644
+index 0000000..861b210
+--- /dev/null
++++ b/tools/ui/src/routes/nim/+page.svelte
+@@ -0,0 +1,9 @@
++<script lang="ts">
++	// SvelteKit requires a route file to physically exist under src/routes for
++	// its router to discover a page at all — this is that file, made as small
++	// as that constraint allows. The actual page lives outside this tree; see
++	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
++	import NimPage from '@mcp-panel/NimPage.svelte';
++</script>
++
++<NimPage />
+diff --git a/tools/ui/src/routes/opencode/+page.svelte b/tools/ui/src/routes/opencode/+page.svelte
+new file mode 100644
+index 0000000..eb06050
+--- /dev/null
++++ b/tools/ui/src/routes/opencode/+page.svelte
+@@ -0,0 +1,9 @@
++<script lang="ts">
++	// SvelteKit requires a route file to physically exist under src/routes for
++	// its router to discover a page at all — this is that file, made as small
++	// as that constraint allows. The actual page lives outside this tree; see
++	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
++	import OpenCodePage from '@mcp-panel/OpenCodePage.svelte';
++</script>
++
++<OpenCodePage />
+diff --git a/tools/ui/src/routes/openrouter/+page.svelte b/tools/ui/src/routes/openrouter/+page.svelte
+new file mode 100644
+index 0000000..71a6a81
+--- /dev/null
++++ b/tools/ui/src/routes/openrouter/+page.svelte
+@@ -0,0 +1,9 @@
++<script lang="ts">
++	// SvelteKit requires a route file to physically exist under src/routes for
++	// its router to discover a page at all — this is that file, made as small
++	// as that constraint allows. The actual page lives outside this tree; see
++	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
++	import OpenRouterPage from '@mcp-panel/OpenRouterPage.svelte';
++</script>
++
++<OpenRouterPage />
+diff --git a/tools/ui/src/routes/rag-collections/+page.svelte b/tools/ui/src/routes/rag-collections/+page.svelte
+new file mode 100644
+index 0000000..539eb3a
+--- /dev/null
++++ b/tools/ui/src/routes/rag-collections/+page.svelte
+@@ -0,0 +1,16 @@
++<script lang="ts">
++	// SvelteKit requires a route file to physically exist under src/routes for
++	// its router to discover a page at all — this is that file, made as small
++	// as that constraint allows. The actual page lives outside this tree; see
++	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
++	//
++	// Icons are imported here (inside tools/ui) and passed down as props
++	// rather than imported directly in RagCollectionsPage.svelte — that file
++	// lives outside tools/ui, where a bare @lucide/svelte import resolves
++	// against the wrong node_modules (see RightBar.svelte's own comment on
++	// this same constraint).
++	import { ChevronDown, Trash2, X } from '@lucide/svelte';
++	import RagCollectionsPage from '@mcp-panel/RagCollectionsPage.svelte';
++</script>
++
++<RagCollectionsPage iconExpand={ChevronDown} iconDelete={Trash2} iconClose={X} />
+diff --git a/tools/ui/src/routes/rag/+page.svelte b/tools/ui/src/routes/rag/+page.svelte
+new file mode 100644
+index 0000000..374c721
+--- /dev/null
++++ b/tools/ui/src/routes/rag/+page.svelte
+@@ -0,0 +1,9 @@
++<script lang="ts">
++	// SvelteKit requires a route file to physically exist under src/routes for
++	// its router to discover a page at all — this is that file, made as small
++	// as that constraint allows. The actual page lives outside this tree; see
++	// /home/murad/Documents/GitHub/llama.cpp/panel/README.md.
++	import RagPage from '@mcp-panel/RagPage.svelte';
++</script>
++
++<RagPage />
+diff --git a/tools/ui/vite.config.ts b/tools/ui/vite.config.ts
+index 0f24a60..9cce795 100644
+--- a/tools/ui/vite.config.ts
++++ b/tools/ui/vite.config.ts
+@@ -47,13 +47,22 @@ export default defineConfig(({ mode }) => {
+ 
+ 		resolve: {
+ 			alias: {
+-				'katex-fonts': resolve('node_modules/katex/dist/fonts')
++				'katex-fonts': resolve('node_modules/katex/dist/fonts'),
++				// Right-bar panel: lives entirely outside this tree, see
++				// /home/murad/Documents/GitHub/llama.cpp/panel/README.md. This alias plus
++				// the one import + one render line in routes/+layout.svelte is the
++				// whole diff against upstream — everything else is out here.
++				'@mcp-panel': '/home/murad/Documents/GitHub/llama.cpp/panel/frontend'
+ 			}
+ 		},
+ 
+ 		server: {
+ 			fs: {
+-				allow: [searchForWorkspaceRoot(process.cwd()), resolve(__dirname, 'tests')]
++				allow: [
++					searchForWorkspaceRoot(process.cwd()),
++					resolve(__dirname, 'tests'),
++					'/home/murad/Documents/GitHub/llama.cpp/panel/frontend'
++				]
+ 			},
+ 			headers: {
+ 				'Cross-Origin-Embedder-Policy': 'require-corp',

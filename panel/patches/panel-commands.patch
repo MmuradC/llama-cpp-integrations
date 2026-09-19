@@ -1,0 +1,197 @@
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte
+index dec9e5b1c7..57b3597ff5 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte
+@@ -1,5 +1,5 @@
+ <script lang="ts">
+-	import { FolderOpen, Sparkles } from '@lucide/svelte';
++	import { FolderOpen, Sparkles, Terminal } from '@lucide/svelte';
+ 	import {
+ 		ChatFormPickerList,
+ 		ChatFormPickerListItem,
+@@ -29,6 +29,10 @@
+ 	const commandIcon: Record<ChatFormCommandAction, typeof Sparkles> = {
+ 		[ChatFormCommandAction.CWD]: FolderOpen,
+ 		[ChatFormCommandAction.MODEL]: MODEL_SELECTOR_ICON,
++		// Fallback only: panel commands bring their own icon (see
++		// panel/frontend/chat-commands/index.ts). The key is still required
++		// here because the record is exhaustive over the action enum.
++		[ChatFormCommandAction.PANEL]: Terminal,
+ 		[ChatFormCommandAction.PROMPT]: Sparkles
+ 	};
+ 
+@@ -119,7 +123,7 @@
+ 		showSearchInput={false}
+ 	>
+ 		{#snippet item(command, index, isSelected)}
+-			{@const Icon = commandIcon[command.action]}
++			{@const Icon = command.icon ?? commandIcon[command.action]}
+ 			<ChatFormPickerListItem
+ 				dataIndex={index}
+ 				disabled={command.disabled}
+diff --git a/tools/ui/src/lib/enums/chat.enums.ts b/tools/ui/src/lib/enums/chat.enums.ts
+index 6dcede2a5e..43d64e9f84 100644
+--- a/tools/ui/src/lib/enums/chat.enums.ts
++++ b/tools/ui/src/lib/enums/chat.enums.ts
+@@ -82,6 +82,12 @@ export enum PdfViewMode {
+ export enum ChatFormCommandAction {
+ 	CWD = 'cwd',
+ 	MODEL = 'model',
++	/**
++	 * Contributed by the panel and dispatched by name, not by this action:
++	 * the bodies live outside this tree, in
++	 * panel/frontend/chat-commands/index.ts.
++	 */
++	PANEL = 'panel',
+ 	PROMPT = 'prompt'
+ }
+ 
+diff --git a/tools/ui/src/lib/hooks/use-chat-form-pickers.svelte.ts b/tools/ui/src/lib/hooks/use-chat-form-pickers.svelte.ts
+index 986cc46c72..a085fa7e9f 100644
+--- a/tools/ui/src/lib/hooks/use-chat-form-pickers.svelte.ts
++++ b/tools/ui/src/lib/hooks/use-chat-form-pickers.svelte.ts
+@@ -11,6 +11,8 @@ import {
+ 	takeMentionDismissSnapshot
+ } from '$lib/utils';
+ 
++import { getPanelCommands, runPanelCommand } from '@mcp-panel/chat-commands';
++
+ /** Dependencies injected as getters so the hook stays free of store circular imports. */
+ export interface UseChatFormPickersOptions {
+ 	getValue: () => string;
+@@ -59,6 +61,7 @@ export function useChatFormPickers(opts: UseChatFormPickersOptions) {
+ 	const mentionScopePath = $derived(opts.getCwd() ?? opts.getServerHome() ?? null);
+ 	const availableCommands = $derived(
+ 		getChatCommands({
++			extraCommands: getPanelCommands,
+ 			hasCwdTools: opts.hasCwdTools,
+ 			hasPrompts: opts.hasPrompts,
+ 			showModelSelector: opts.getShowModelSelector()
+@@ -102,6 +105,14 @@ export function useChatFormPickers(opts: UseChatFormPickersOptions) {
+ 				opts.setValue('');
+ 				opts.openModelSelector();
+ 
++				break;
++			case ChatFormCommandAction.PANEL:
++				// Panel-contributed command: consume the token, then hand the name
++				// and any typed arguments to the panel, which owns every body.
++				isWorkingDirectoryPickerOpen = false;
++				opts.setValue('');
++				runPanelCommand(command.name, args);
++
+ 				break;
+ 		}
+ 	}
+diff --git a/tools/ui/src/lib/types/chat.d.ts b/tools/ui/src/lib/types/chat.d.ts
+index 86a868c33a..1079c35f13 100644
+--- a/tools/ui/src/lib/types/chat.d.ts
++++ b/tools/ui/src/lib/types/chat.d.ts
+@@ -220,6 +220,14 @@ export interface ChatCommandsOptions {
+ 	hasPrompts: () => boolean;
+ 	/** Gates `/cwd`. */
+ 	hasCwdTools: () => boolean;
++	/**
++	 * Extra commands to append after the built-in three, contributed by the
++	 * panel (see panel/frontend/chat-commands/index.ts). A getter rather than
++	 * a plain array so the caller can evaluate the commands' own availability
++	 * predicates against live state on each call — the registry itself
++	 * deliberately imports no stores.
++	 */
++	extraCommands?: () => ChatFormCommand[];
+ }
+ 
+ /** Protocol-level verbs accepted by the realtime inference control endpoint. Mirrors `CONTROL_ACTION`. */
+@@ -228,6 +236,8 @@ export type ControlAction = 'reasoning_end';
+ export interface ChatFormCommand {
+ 	name: string;
+ 	description: string;
++	/** Optional icon; the picker falls back to the action's own icon. */
++	icon?: Component;
+ 	/** Extra search terms that should match this command in the picker. */
+ 	keywords?: string[];
+ 	action: ChatFormCommandAction;
+diff --git a/tools/ui/src/lib/utils/chat-commands.ts b/tools/ui/src/lib/utils/chat-commands.ts
+index 9345f0a48e..164ba13770 100644
+--- a/tools/ui/src/lib/utils/chat-commands.ts
++++ b/tools/ui/src/lib/utils/chat-commands.ts
+@@ -9,6 +9,11 @@ import type { ChatCommandsOptions, ChatFormCommand } from '$lib/types';
+  * module is re-exported through the `$lib/utils` barrel, and importing
+  * stores at module load would create a circular dependency (the stores
+  * themselves import from `$lib/utils`).
++ *
++ * The panel's own commands arrive through `options.extraCommands` and are
++ * listed after these three, so the built-ins keep their familiar positions at
++ * the top. Their bodies live outside this tree; see
++ * panel/frontend/chat-commands/index.ts.
+  */
+ export function getChatCommands(options: ChatCommandsOptions): ChatFormCommand[] {
+ 	return [
+@@ -30,6 +35,7 @@ export function getChatCommands(options: ChatCommandsOptions): ChatFormCommand[]
+ 			description: 'Select model',
+ 			disabled: !options.showModelSelector,
+ 			name: 'model'
+-		}
++		},
++		...(options.extraCommands?.() ?? [])
+ 	];
+ }
+diff --git a/tools/ui/src/lib/utils/panel-command-runtime.ts b/tools/ui/src/lib/utils/panel-command-runtime.ts
+new file mode 100644
+index 0000000000..0a6d9333d1
+--- /dev/null
++++ b/tools/ui/src/lib/utils/panel-command-runtime.ts
+@@ -0,0 +1,54 @@
++/**
++ * The npm-packaged pieces the panel's own UI needs, re-exported for it.
++ *
++ * Started as the slash commands' imports; the Projects UI needs the same kind
++ * of thing, so this is now the panel's single import surface for node_modules.
++ *
++ * panel/frontend lives outside the tools/ui tree (see
++ * panel/patches/README.md), and a
++ * bare package specifier in a file there resolves node_modules relative to
++ * that file's own path — which never reaches tools/ui/node_modules. Importing
++ * `@lucide/svelte` or `svelte-sonner` directly from panel/frontend therefore
++ * fails at build time with a vite:load-fallback error. RightBar.svelte works
++ * around the same constraint by taking its icons as props from in-tree code;
++ * the panel's UI needs a whole set of them plus the toast helper, so they are
++ * funnelled through this shim instead — panel/frontend/chat-commands/index.ts
++ * and panel/frontend/projects/* import from here via `$lib`, which is a global
++ * alias and resolves the same way for any importer.
++ *
++ * Deliberately NOT exported through the `$lib/utils` barrel: panel-ui.patch
++ * already touches lib/utils/index.ts, and keeping this file out of it means
++ * no two patches ever edit the same file.
++ *
++ * Only the icons the panel actually uses are listed — a wildcard re-export
++ * would defeat the point by pulling the whole icon set into the panel chunk.
++ */
++
++export {
++	Activity,
++	Check,
++	ChevronRight,
++	CircleQuestionMark,
++	Copy,
++	Download,
++	Folder,
++	FolderPlus,
++	Gauge,
++	GitBranch,
++	History,
++	MemoryStick,
++	PackageOpen,
++	Palette,
++	Pencil,
++	PencilLine,
++	Plug,
++	Plus,
++	Receipt,
++	Settings,
++	ShieldCheck,
++	Square,
++	SquarePen,
++	Trash2,
++	X
++} from '@lucide/svelte';
++export { toast } from 'svelte-sonner';

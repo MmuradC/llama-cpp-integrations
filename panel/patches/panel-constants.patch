@@ -1,0 +1,122 @@
+diff --git a/tools/ui/src/lib/constants/compaction.constants.ts b/tools/ui/src/lib/constants/compaction.constants.ts
+new file mode 100644
+index 0000000..8d4ce76
+--- /dev/null
++++ b/tools/ui/src/lib/constants/compaction.constants.ts
+@@ -0,0 +1,67 @@
++/**
++ * Constants for conversation compaction.
++ *
++ * compactConversation() (chatStore) asks the model for a summary of the
++ * conversation so far, then stores it as a normal synthetic user message
++ * prefixed with COMPACTION_SUMMARY_PREFIX - same pattern as the cwd-change
++ * synthetic message (see path-display.constants.ts), just a different
++ * marker. The prefix lets the UI render a dedicated chip
++ * (ChatMessageCompactionSummary.svelte) instead of a plain bubble, and lets
++ * streamChatCompletion (via the conversation's compactedThroughMessageId)
++ * find where to trim the outgoing request. Nothing is ever deleted: the
++ * original messages stay in IndexedDB, just excluded from what gets sent to
++ * the model on later turns.
++ */
++
++export const COMPACTION_SUMMARY_PREFIX = 'Conversation compacted. Summary of the discussion so far:\n\n';
++
++export const DEFAULT_COMPACTION_PROMPT =
++	'Summarize the conversation below as tersely as possible while still preserving every fact, ' +
++	'decision, file path, and piece of context that would be needed to continue the discussion ' +
++	'without the original messages. Cut pleasantries, filler, and anything restated more than ' +
++	'once; prefer short sentences over flowing prose. Write it as plain prose, not a transcript.' +
++	'\n\n{{TRANSCRIPT}}';
++
++/**
++ * When a single summarization call would not have room for both the full
++ * transcript AND the summary it needs to produce (the exact case that fails
++ * hardest: compacting a conversation that has already filled its context),
++ * the transcript is split into batches, each summarized on its own, then
++ * those partial summaries are combined with this prompt into one final
++ * summary. A conversation short enough to summarize in one call skips this
++ * reduce step entirely.
++ */
++export const COMBINE_SUMMARIES_PROMPT =
++	'The parts below are summaries of consecutive pieces of one longer conversation, in order. ' +
++	'Combine them into a single, as-terse-as-possible summary as if you had summarized the whole ' +
++	'conversation at once: preserve every fact, decision, file path, and piece of context, but ' +
++	'drop anything repeated across parts. Write it as plain prose, not a list of parts.' +
++	'\n\n{{PARTIAL_SUMMARIES}}';
++
++/**
++ * Chars-per-context-token budget used to turn a model's token context size
++ * into a safe character cap per batch. Deliberately conservative (1, well
++ * under English prose's typical ~4 chars/token) for two reasons: this
++ * user's conversations skew code/config/path-heavy, which tokenizes denser
++ * than prose, and the budget has to leave room for more than just the
++ * transcript - the wrapping prompt text, the active model's system prompt,
++ * and critically the output tokens the summary itself needs to generate.
++ * Tested against a simulated 100%-full 32768-token conversation: this value
++ * reliably splits it into multiple batches instead of landing at the edge
++ * of the same failure being fixed here.
++ */
++export const COMPACTION_CHARS_PER_CONTEXT_TOKEN = 1;
++
++/** A conversation shorter than this has nothing meaningful to save by compacting. */
++export const MIN_MESSAGES_FOR_COMPACTION = 4;
++
++/** Batch-size fallback when the active model's context size is not yet known. */
++export const DEFAULT_COMPACTION_CONTEXT_TOKENS = 8192;
++
++/**
++ * Chars-per-token used only for the UI's "reduced from X to Y tokens" display line -
++ * unlike COMPACTION_CHARS_PER_CONTEXT_TOKEN above, this is meant to be a realistic
++ * estimate, not a conservative safety margin, so it uses the ordinary ~4 chars/token
++ * rule of thumb rather than that constant's deliberately pessimistic value of 1.
++ */
++export const DISPLAY_CHARS_PER_TOKEN_ESTIMATE = 4;
+diff --git a/tools/ui/src/lib/constants/index.ts b/tools/ui/src/lib/constants/index.ts
+index e324137..164c918 100644
+--- a/tools/ui/src/lib/constants/index.ts
++++ b/tools/ui/src/lib/constants/index.ts
+@@ -20,6 +20,7 @@ export * from './tool-ui.constants';
+ export * from './cache.constants';
+ export * from './chat-form.constants';
+ export * from './cli-flags.constants';
++export * from './compaction.constants';
+ export * from './code-block.constants';
+ export * from './context-keys.constants';
+ export * from './control-actions.constants';
+diff --git a/tools/ui/src/lib/constants/routes.constants.ts b/tools/ui/src/lib/constants/routes.constants.ts
+index 1f518a7..51515c0 100644
+--- a/tools/ui/src/lib/constants/routes.constants.ts
++++ b/tools/ui/src/lib/constants/routes.constants.ts
+@@ -13,6 +13,8 @@ export const ROUTES = {
+ 	CHAT: '#/chat',
+ 	/** MCP servers. */
+ 	MCP_SERVERS: '#/mcp-servers',
++	/** RAG collections. */
++	RAG_COLLECTIONS: '#/rag-collections',
+ 	/** Search — mobile-only full-page conversation search. */
+ 	SEARCH: '#/search',
+ 	/** Root — start of the app. */
+diff --git a/tools/ui/src/lib/constants/ui.constants.ts b/tools/ui/src/lib/constants/ui.constants.ts
+index f40cecf..23c48c4 100644
+--- a/tools/ui/src/lib/constants/ui.constants.ts
++++ b/tools/ui/src/lib/constants/ui.constants.ts
+@@ -1,4 +1,5 @@
+-import { Package, Search, Settings, SquarePen } from '@lucide/svelte';
++import { ROUTES } from './routes.constants';
++import { Library, Package, Search, Settings, SquarePen } from '@lucide/svelte';
+ import { SidebarAction, ToolSource } from '$lib/enums';
+ import type { DesktopIconStripItem } from '$lib/types';
+ 
+@@ -61,6 +62,12 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
+ 		tooltip: 'New chat'
+ 	},
+ 	{ icon: Search, keys: ['cmd', 'k'], tooltip: 'Search' },
++	{
++		activeRouteId: '/rag-collections',
++		icon: Library,
++		route: ROUTES.RAG_COLLECTIONS,
++		tooltip: 'RAG Collections'
++	},
+ 	{
+ 		action: SidebarAction.SETTINGS,
+ 		icon: Settings,

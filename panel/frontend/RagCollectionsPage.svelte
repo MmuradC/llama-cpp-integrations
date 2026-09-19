@@ -146,7 +146,7 @@
 				<Empty.Header>
 					<Empty.Title>No RAG collections yet</Empty.Title>
 					<Empty.Description>
-						Upload documents from the "Manage RAG documents" link in the right sidebar to create
+						Upload documents from the "RAG Editor" button in the right sidebar to create
 						one.
 					</Empty.Description>
 				</Empty.Header>

@@ -1,6 +1,6 @@
 <script lang="ts">
 	// Lives entirely outside llama.cpp's own source tree — see ../README.md.
-	// Reached from the "Manage RAG documents" link in RightBar.svelte. The
+	// Reached from the "RAG Editor" button in RightBar.svelte. The
 	// route file that makes this discoverable to SvelteKit's router is
 	// tools/ui/src/routes/rag/+page.svelte, same stub pattern as OpenRouterPage.
 	//
