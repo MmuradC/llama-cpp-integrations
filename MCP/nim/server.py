@@ -67,7 +67,9 @@ def _no_key_message() -> str:
 
 def _request(path: str, payload: dict | None = None, timeout: int | None = None) -> dict:
     key = _api_key()
-    headers = {"Accept": "application/json"}
+    # see MCP/opencode/server.py's _request for why: urllib's default UA gets
+    # flagged by Cloudflare-style bot protection on some providers' endpoints.
+    headers = {"Accept": "application/json", "User-Agent": "llama-cpp-panel-nim-mcp/1.0"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     data = None

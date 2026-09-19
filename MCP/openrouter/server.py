@@ -69,7 +69,9 @@ def _no_key_message() -> str:
 
 def _request(path: str, payload: dict | None = None, timeout: int | None = None) -> dict:
     key = _api_key()
-    headers = {"Accept": "application/json"}
+    # see MCP/opencode/server.py's _request for why: urllib's default UA gets
+    # flagged by Cloudflare-style bot protection on some providers' endpoints.
+    headers = {"Accept": "application/json", "User-Agent": "llama-cpp-panel-openrouter-mcp/1.0"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     referer = os.environ.get("OPENROUTER_REFERER", "").strip()
@@ -155,6 +157,23 @@ def ask_openrouter(
 
     answer = (choice.get("content") or "").strip()
     if not answer:
+        # Reasoning models (z-ai/glm-5.x, deepseek-v4.x, nvidia/nemotron-3, …)
+        # spend the completion budget inside "reasoning" first and only then
+        # write the actual answer into "content". A max_tokens small enough
+        # to run out inside that reasoning phase leaves content empty — which
+        # here used to be reported as the flatly misleading "(model returned
+        # no content)", reading to a caller exactly like a broken model
+        # rather than a budget that was one number too small. Now surface the
+        # reasoning we did receive, and say what actually happened.
+        reasoning = (choice.get("reasoning") or "").strip()
+        if reasoning:
+            completion_tokens = (result.get("usage") or {}).get("completion_tokens", "?")
+            return (
+                f"{reasoning}\n\n"
+                f"[No answer was produced. This is a reasoning model and all "
+                f"{completion_tokens} completion tokens went into its reasoning "
+                f"phase; raise max_tokens above {payload['max_tokens']} to get real output.]"
+            )
         answer = "(model returned no content)"
 
     usage = result.get("usage") or {}

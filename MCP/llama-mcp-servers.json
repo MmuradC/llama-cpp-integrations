@@ -9,6 +9,13 @@
       ],
       "timeout_ms": 30000
     },
+    "files": {
+      "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "args": [
+        "/home/murad/Documents/GitHub/llama.cpp/MCP/files/server.py"
+      ],
+      "timeout_ms": 30000
+    },
     "git": {
       "command": "/home/murad/.local/bin/mcp-server-git",
       "args": [],
@@ -46,6 +53,16 @@
       },
       "timeout_ms": 900000
     },
+    "mermaid": {
+      "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "args": [
+        "/home/murad/Documents/GitHub/llama.cpp/MCP/mermaid/server.py"
+      ],
+      "env": {
+        "MERMAID_SUGGESTIONS": "4"
+      },
+      "timeout_ms": 30000
+    },
     "nim": {
       "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/.venv/bin/python",
       "args": [
@@ -65,6 +82,18 @@
       "env": {
         "OPENROUTER_API_KEY_FILE": "/home/murad/.config/mcp-secrets/openrouter.key",
         "OPENROUTER_MODEL": "meta-llama/llama-3.3-70b-instruct"
+      },
+      "timeout_ms": 300000
+    },
+    "opencode": {
+      "command": "/home/murad/Documents/GitHub/llama.cpp/MCP/imagegen/.venv/bin/python",
+      "args": [
+        "/home/murad/Documents/GitHub/llama.cpp/MCP/opencode/server.py"
+      ],
+      "env": {
+        "OPENCODE_API_KEY_FILE": "/home/murad/.config/mcp-secrets/opencode.key",
+        "OPENCODE_BASE_URL": "https://opencode.ai/zen/go/v1",
+        "OPENCODE_MODEL": "kimi-k3"
       },
       "timeout_ms": 300000
     },
