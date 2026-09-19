@@ -1,0 +1,126 @@
+{
+  "$comment": "Machine-readable module list for llama-cpp-integrations' integration layer. Read by the PKGBUILD (to know what to apply) and by anyone regenerating a patch. One module = one concern; a conflict in one must never block the others.",
+  "project": "llama-cpp-integrations",
+  "modules": [
+    {
+      "name": "server-model-hooks",
+      "applies_to": "llama.cpp v0.4.0 (and later — touches stable C++ interfaces)",
+      "patch": "modules/server-model-hooks/server-model-hooks.patch",
+      "files": [
+        "tools/server/server-models.cpp",
+        "tools/server/server-models.h",
+        "tools/server/server-tools.cpp"
+      ],
+      "purpose": "Expose pinned remote models to the router: model listing, per-model proxy targets, and the tool listing the panel tabs read."
+    },
+    {
+      "name": "panel-shell",
+      "applies_to": "NOT YET EXTRACTED — see README, 'Which llama.cpp version this targets'",
+      "patch": null,
+      "files": ["tools/ui/vite.config.ts", "tools/ui/src/routes/+layout.svelte"],
+      "purpose": "The Vite alias (@mcp-panel -> panel/frontend) and the single render line that mount the whole panel. Without these two edits nothing in panel/frontend is reachable."
+    },
+    {
+      "name": "compaction",
+      "applies_to": "NOT YET EXTRACTED",
+      "patch": null,
+      "files": [
+        "tools/ui/src/lib/constants/compaction.constants.ts",
+        "tools/ui/src/lib/utils/compaction.ts",
+        "tools/ui/src/lib/stores/chat/index.svelte.ts",
+        "tools/ui/src/lib/services/chat.service.ts",
+        "tools/ui/src/lib/types/database.d.ts",
+        "tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageCompactionSummary.svelte",
+        "tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte"
+      ],
+      "purpose": "Summarize a long conversation with the model, keep the summary as a new message, and trim what is resent. Nothing is ever deleted. Includes the zero-context-size fix: a remote model reports n_ctx 0, and treating that as a real budget made one API call per message."
+    },
+    {
+      "name": "media",
+      "applies_to": "NOT YET EXTRACTED",
+      "patch": null,
+      "files": [
+        "tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts",
+        "tools/ui/src/lib/services/read-media.service.ts",
+        "tools/ui/src/lib/utils/convert-files-to-extra.ts",
+        "tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte"
+      ],
+      "purpose": "Make images work for models that cannot see: the image is attached for its preview, saved to disk by the panel backend, and only its path is sent to a text-only model (a vision MCP tool reads it from there)."
+    },
+    {
+      "name": "markdown",
+      "applies_to": "NOT YET EXTRACTED",
+      "patch": null,
+      "files": [
+        "tools/ui/src/lib/components/app/content/MarkdownContent/MarkdownContent.svelte",
+        "tools/ui/src/lib/components/app/content/MarkdownContent/markdown-content.css",
+        "tools/ui/src/lib/components/app/content/MarkdownContent/markdown-utils.ts",
+        "tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/code-block-utils.ts",
+        "tools/ui/src/lib/components/app/content/MarkdownContent/plugins/rehype/enhance-code-blocks.ts",
+        "tools/ui/src/lib/constants/code-block.constants.ts",
+        "tools/ui/src/lib/constants/markdown.constants.ts",
+        "tools/ui/src/lib/constants/icons.constants.ts"
+      ],
+      "purpose": "Rendered output: enhanced code blocks and their styling."
+    },
+    {
+      "name": "rag-pages",
+      "applies_to": "NOT YET EXTRACTED",
+      "patch": null,
+      "files": [
+        "tools/ui/src/routes/rag/+page.svelte",
+        "tools/ui/src/routes/rag-collections/+page.svelte"
+      ],
+      "purpose": "Routes that surface the RAG collection browser and editor (the pages themselves live in panel/frontend, reached through the @mcp-panel alias)."
+    },
+    {
+      "name": "slash-commands",
+      "applies_to": "llama.cpp v0.4.0 (extracted; verified applying)",
+      "patch": "modules/slash-commands/slash-commands.patch",
+      "files": [
+        "tools/ui/src/lib/enums/chat.enums.ts",
+        "tools/ui/src/lib/types/chat.d.ts",
+        "tools/ui/src/lib/utils/chat-commands.ts",
+        "tools/ui/src/lib/utils/panel-command-runtime.ts",
+        "tools/ui/src/lib/hooks/use-chat-form-pickers.svelte.ts",
+        "tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte"
+      ],
+      "purpose": "Register the panel's commands in the WebUI's own / picker (it ships three; this adds the rest) and provide panel-command-runtime.ts, the panel's single import surface for anything from node_modules."
+    },
+    {
+      "name": "permission-modes",
+      "applies_to": "NOT YET EXTRACTED",
+      "patch": null,
+      "files": [
+        "tools/ui/src/lib/stores/permission-mode.svelte.ts",
+        "tools/ui/src/lib/stores/agentic/gates.svelte.ts",
+        "tools/ui/src/lib/constants/agentic.constants.ts",
+        "tools/ui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionPermissionMode.svelte"
+      ],
+      "purpose": "Permission mode per chat rather than per browser, and a gate that asks for anything that can modify state: the always-allow list may only silence tools that cannot write, EDIT_APPROVED_TOOLS is empty, and the default mode is manual."
+    },
+    {
+      "name": "incognito",
+      "applies_to": "NOT YET EXTRACTED",
+      "patch": null,
+      "files": [
+        "tools/ui/src/lib/stores/incognito-chat.svelte.ts",
+        "tools/ui/src/lib/services/database.service.ts",
+        "tools/ui/src/lib/services/chat.service.ts"
+      ],
+      "purpose": "A chat that is never written to disk: every write for it is intercepted at DatabaseService (the single choke point) and served from memory, plus the localStorage stream-resume write is skipped."
+    },
+    {
+      "name": "tailwind-source",
+      "applies_to": "NOT YET EXTRACTED",
+      "patch": null,
+      "files": ["tools/ui/src/app.css"],
+      "purpose": "@source for panel/frontend. Tailwind generates a class only if it is found in a scanned file, so without this the panel renders unstyled — the dashboard's grid collapsed to one column and its colours vanished."
+    }
+  ],
+  "notes": {
+    "why_not_all_extracted": "The live tree (master-era UI) and the packaged tree (v0.4.0) are different UI generations, so a patch extracted from one does not apply to the other. Modules marked NOT YET EXTRACTED exist and work in the live tree; their patch files still have to be generated against whichever tree a given build uses.",
+    "archive": "archive/ holds the original v0.4.0-targeted panel-constants.patch and panel-ui.patch. They do not apply to the live tree and are kept as history only.",
+    "apply_order": "server-model-hooks is independent of the UI modules. The UI modules must be applied in the order listed only if two of them touch the same file — currently none do, which is the property this split is meant to preserve."
+  }
+}

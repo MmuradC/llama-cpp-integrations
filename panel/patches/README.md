@@ -1,119 +1,70 @@
-# Panel patches
+# llama-cpp-integrations — patch modules
 
-Split from a single `right-bar.patch` on 2026-09-05 (targeting llama.cpp
-v0.4.0) so a future version bump doesn't require re-resolving one large diff —
-each patch only touches files for one concern, so a conflict in one doesn't
-block the others from applying.
+This directory is the **llama-cpp-integrations** project's own integration layer
+for llama.cpp's web UI and server. It used to be three anonymous patches
+(`server-hooks`, `panel-constants`, `panel-ui`) plus a commands patch, split by
+*file location*, which meant one of them (`panel-ui`) was a 34-file grab-bag
+mixing seven unrelated features: markdown rendering, compaction, image
+handling, the right-bar, RAG pages and more. Adding anything meant editing that
+pile, and a conflict in one feature blocked every other.
 
-- `server-hooks.patch` — C++ server changes (`tools/server/server-models.*`,
-  `server-tools.cpp`) that expose model listings for the nim/openrouter/rag tabs.
-- `panel-constants.patch` — routes, sidebar icon-strip entries, and UI
-  constants. Smallest, but the most likely to drift: upstream reshuffles its
-  own constants/sidebar layout often — both conflicts in the 0.2.0 -> 0.3.0
-  bump and two of the five in 0.3.0 -> 0.4.0 landed here.
-- `panel-ui.patch` — everything else: new routes (nim/openrouter/rag/
-  rag-collections), stores, services, chat components (image/media upload,
-  compaction summaries, tool-call rendering).
-- `panel-commands.patch` — the panel's slash commands: extends the WebUI's own
-  `/` command picker (which ships `/model`, `/cwd`, `/prompt`) with the panel's
-  own set. Touches five upstream files and adds one, none of which any other
-  patch touches:
+It is now organised by **what it does**, one directory per module, and it is
+owned by this repo rather than being an incidental patch on upstream.
 
-  | file | change |
-  | --- | --- |
-  | `lib/enums/chat.enums.ts` | one enum member: `ChatFormCommandAction.PANEL` |
-  | `lib/types/chat.d.ts` | optional `icon` on `ChatFormCommand`; `extraCommands` option |
-  | `lib/utils/chat-commands.ts` | appends `options.extraCommands?.()` to the registry |
-  | `lib/hooks/use-chat-form-pickers.svelte.ts` | passes the getter in; one dispatch case |
-  | `ChatFormPickerCommand.svelte` | `command.icon ?? commandIcon[command.action]`, plus the fallback icon |
-  | `lib/utils/panel-command-runtime.ts` | **new** — re-exports the icons and `toast` |
+```
+patches/
+  manifest.json          machine-readable module list (name, path, applies-to, files)
+  modules/
+    server-model-hooks/  C++ side: what the router advertises and proxies
+    panel-shell/         the right-bar mount and the panel's own routes
+    compaction/          summarize-and-trim for long conversations
+    media/               images, audio, PDFs: attach, fall back, read
+    markdown/            code blocks and rendered output
+    rag-pages/           RAG collection browser and editor
+    slash-commands/      the panel's commands in the WebUI's own picker
+    permission-modes/    per-chat permission modes
+    incognito/           chats that are never written to disk
+    tailwind-source/     makes panel classes visible to Tailwind
+  archive/               the original v0.4.0 patch set, unmaintained
+```
 
-Apply in any order — they don't touch the same files. `fork/pkg-build/PKGBUILD`
-applies all four in `prepare()`.
+## What each module is, and what applying it requires
 
-## The slash commands (panel-commands.patch)
+Every module has a `README.md` stating the files it touches, what it does, and
+the exact `git apply` line. Order matters only where a module depends on
+another (noted per module); otherwise they are independent.
 
-All fifteen command *bodies* live outside the tree, in
-`panel/frontend/chat-commands/index.ts`. The patch is only the seam: the tree
-supplies the picker, the panel supplies the commands. Two consequences worth
-knowing before touching either side.
+| module | touches | why it exists |
+|---|---|---|
+| `server-model-hooks` | `tools/server/server-models.*`, `server-tools.cpp` | exposes remote/pinned models to the router so they appear in the model list and proxy through the panel |
+| `panel-shell` | `tools/ui/vite.config.ts`, `routes/+layout.svelte` | one Vite alias (`@mcp-panel` → `panel/frontend`) plus one render line: the whole reason the panel can live outside llama.cpp |
+| `compaction` | chat store, constants, `utils/compaction.ts`, summary message component | ask the model to summarize a long conversation, then trim what is resent — nothing is deleted |
+| `media` | file-upload hook, `read-media.service.ts`, message extras, image-path handling | images work for models **without** vision: the file is saved and its path is handed to the model |
+| `markdown` | `MarkdownContent/*`, code-block and markdown constants | rendered output: enhanced code blocks, styling |
+| `rag-pages` | `routes/rag*`, RAG frontend pages | browse and edit the RAG collections the MCP server exposes |
+| `slash-commands` | command registry, enums, types, picker, `panel-command-runtime.ts` | adds the panel's commands to the WebUI's existing `/` picker |
+| `permission-modes` | `stores/permission-mode`, `stores/agentic/gates`, mode picker | the mode applies **per chat**, and the always-allow list can only silence tools that cannot write |
+| `incognito` | `stores/incognito-chat.svelte.ts` + guards in `DatabaseService` | a chat whose writes are intercepted at the single choke point, so it never reaches IndexedDB |
+| `tailwind-source` | `src/app.css` | Tailwind only scans `src/`, so without this every class used **only** by panel components is never generated and the panel renders unstyled |
 
-**To add or change a command, no patch work is needed.** Add an entry to
-`COMMANDS` in `panel/frontend/chat-commands/index.ts` and rebuild — the picker,
-the filtering and the keyboard navigation all come from upstream. `run` gets
-the text typed after the command name; `disabled` is evaluated on every picker
-open, so it can read stores directly.
+## Which llama.cpp version this targets
 
-**Anything a command needs from node_modules must go through
-`lib/utils/panel-command-runtime.ts`.** A bare package specifier
-(`@lucide/svelte`, `svelte-sonner`) in a file under `panel/frontend` resolves
-node_modules relative to *its own* path, never reaching `tools/ui/node_modules`,
-and fails the build with `vite:load-fallback`. That file is the same workaround
-`RightBar.svelte` documents for its two icons. It is deliberately not exported
-through the `$lib/utils` barrel, because `panel-ui.patch` already edits that
-barrel.
+The modules in `modules/` were extracted from the **live tree**
+(`fork/pkg-build/llama.cpp-src`, master-era UI with hash routing) and are the
+ones that describe what actually runs. `archive/` holds the original
+v0.4.0-targeted set, which does **not** apply to the live tree and is kept only
+as history.
 
-Verification, since `npm run build` is what the PKGBUILD runs: apply all four
-patches to a fresh `--depth 1 --branch v0.4.0` clone, then `npm run build` in
-`tools/ui`.
+Because the two trees are different UI generations, a module's patch applies to
+the generation it was extracted from. `manifest.json` records that per module
+under `applies_to`.
 
-### Known non-issue: a 7th `svelte-check` error
+## Adding or changing a module
 
-`npm run check` reports `Cannot find module '@mcp-panel/chat-commands'` for the
-hook, alongside the six identical errors the existing patch already produces
-for `@mcp-panel/RightBar.svelte` and the panel's `+page.svelte` route files.
-Cause is shared: the alias is a Vite-only alias and `tsconfig.json` has no
-`paths` entry. Adding one was deliberately avoided — it would make svelte-check
-try to typecheck all of `panel/frontend` for the first time, turning one known
-cosmetic error into an unknown pile in files this patch shouldn't be touching.
-`npm run build` does not typecheck, so this affects neither the package nor the
-dev server.
+1. Edit the live tree (`fork/pkg-build/llama.cpp-src`) until the behaviour is right.
+2. Regenerate only that module's patch:
+   `git diff -- <its files> > modules/<name>/<name>.patch`
+3. Update `manifest.json` if the file list changed.
 
-## Regenerating after a version bump
-
-1. Shallow-clone the new tag: `git clone --depth 1 --branch v<ver> https://github.com/ggml-org/llama.cpp.git /tmp/test`
-2. `cd /tmp/test && git apply --reject --whitespace=nowarn <path-to-old-full-patch>`
-   — anything that fails leaves a `.rej` file.
-3. Read each `.rej` against the *current* upstream file (not the old one) and
-   hand-apply the equivalent change — these are usually upstream renaming or
-   moving a neighboring line, not real semantic conflicts with the panel
-   feature. Watch specifically for: unrelated prop-reordering (prettier/eslint
-   drift breaks context matching even though nothing changed) vs. an actually
-   removed anchor (e.g. the MCP-servers sidebar entry was deleted upstream in
-   0.4.0, so the RAG-collections entry had to move to a different anchor
-   point, and its `ROUTES`/icon imports had to be re-added since the file no
-   longer imported them for any other reason).
-4. `git add -A && git diff --cached > full.patch` (staging first is required —
-   plain `git diff` silently omits new untracked files added by the patch).
-5. Re-split: `git diff --cached -- <paths for one concern> > name.patch` per
-   group above.
-6. Verify: apply all three, in order, to a *second* fresh clone of the same
-   tag and confirm `git diff --cached --stat` matches step 4's total exactly.
-
-## Known landmine: absolute paths inside the panel itself
-
-`panel/frontend` lives entirely outside the llama.cpp tree by design — the
-whole integration is one Vite resolve alias (`@mcp-panel`) plus one
-`server.fs.allow` entry in `vite.config.ts`, both pointing at this repo's
-absolute path on disk. `git apply` succeeding proves nothing about this —
-the patch applies fine either way; it only breaks at `npm run build`
-(`vite:load-fallback ... ENOENT`), or at dev-server runtime. If this repo
-ever moves again, grep the 3 patches for the repo's old absolute path
-before assuming a successful `makepkg` build. Bit us once already
-(2026-09-06, right after the 2026-09-01 move) — see git blame on
-`panel-ui.patch`'s `vite.config.ts` hunk.
-
-## History
-
-- 2026-09-17: added `panel-commands.patch` (slash commands), split from nothing
-  — it is new, not carved out of an existing patch, and was verified applying
-  fourth and last against a fresh v0.4.0 clone (46 files changed in total).
-- 0.2.0 baseline (28 files) -> 0.3.0: 2 conflicts, both in
-  `panel-constants.patch` (upstream dropped a `NEW_CHAT` route and changed an
-  enum import path — pure context drift, not semantic).
-- 0.3.0 -> 0.4.0: 5 conflicts — the same 2 constants files again, plus 3 in
-  `panel-ui.patch` (`ChatMessageSynthetic.svelte`,
-  `ChatMessageToolCallBlockReadMedia.svelte` — both just prop-reorder drift —
-  and `database.d.ts`, where upstream inserted two new fields ahead of the
-  insertion point, pure line-shift). `server-hooks.patch` has needed zero
-  fixes across both bumps.
+Keep a module to one concern. The old single-patch approach is exactly what
+this replaces: a conflict in one feature must not block the others.
