@@ -29,9 +29,11 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 import traceback
+import urllib.request
 from html import escape
 from pathlib import Path
 
@@ -81,6 +83,58 @@ SECRET_FILES = {
     "nim": Path("/home/murad/.config/nvidia-nim.key"),
     "opencode": Path("/home/murad/.config/mcp-secrets/opencode.key"),
 }
+
+
+def _secret_value(name: str) -> str:
+    """Read one provider key from disk. Same map as the save endpoint above,
+    so a key written through the UI is immediately readable here — no second
+    source of truth for where a secret lives."""
+    try:
+        return SECRET_FILES[name].read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+# ---------- tiny JSON cache (live third-party reads) ----------
+
+# The panel polls every few seconds; endpoints that proxy a third party cache
+# their last good payload instead of forwarding every poll. One small file per
+# endpoint, and a stale-but-present payload beats a blank row when upstream
+# hiccups — the reader flags it rather than pretending it is fresh.
+
+
+def _read_json_cache(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_json_cache(path: Path, data: dict) -> None:
+    """Best-effort, atomic: a cache that fails to write must never break the
+    request that produced the fresh value."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+# Live OpenCode Go plan allowance. GET /usage on the Go endpoint answers the
+# real three-window figures (rolling 5h / weekly / monthly, percent used plus
+# resetsAt) — verified live 2026-10-02. This *is* an official usage API; the
+# earlier "OpenCode has no usage API" note in opencode_usage_page() referred
+# to the console-only per-model view and predates this endpoint being found.
+OPENCODE_GO_BASE = "https://opencode.ai/zen/go/v1"
+OPENCODE_PLAN_CACHE_FILE = Path("/home/murad/.config/mcp-secrets/opencode-plan-usage.json")
+OPENCODE_PLAN_TTL_S = 60
+# Cloudflare in front of opencode.ai rejects the default urllib UA (see
+# MCP/opencode/server.py, same finding); a real UA plus the session header
+# avoids both the 403 and the MissingSessionID 400.
+OPENCODE_USER_AGENT = "opencode/1.0 (+panel-backend)"
 
 # Every remote provider a model can be pinned from. The router
 # (server-models.cpp's load_remote_model_presets(), see the fork patch)
@@ -209,6 +263,140 @@ async def _sd_status(client: httpx.AsyncClient) -> dict:
         return {"reachable": True, "model": model.get("name") if isinstance(model, dict) else None}
     except Exception:
         return {"reachable": False}
+
+
+# --- sd-server power control -------------------------------------------------
+#
+# The image server is a systemd *user* unit (sd-server.service, see
+# ~/.config/systemd/user/), so the panel can start/stop it with an unprivileged
+# `systemctl --user` — no sudo, no polkit prompt. This backend is started from
+# the user's own session and inherits XDG_RUNTIME_DIR and
+# DBUS_SESSION_BUS_ADDRESS (verified: both are in its environ), which is what
+# `systemctl --user` needs to find the user manager; the two are also passed
+# explicitly below so the endpoint keeps working if the service is ever moved
+# to a system unit with a clean environment.
+#
+# `sd-server` is not the only thing that could be driven this way, so the unit
+# name is a dict, not a string: an allowlist. The endpoint takes a unit *key*
+# from this map and never a unit name from the request, so a malformed or
+# hostile request cannot name an arbitrary unit (or smuggle extra systemctl
+# arguments through it).
+#
+# Deliberately NOT starting it on demand when an imagegen tool call arrives:
+# the model is ~7 GB of weights, and loading it as a side effect of an
+# unrelated request would block that request for a minute and quietly claim a
+# several-GB slice of VRAM. An explicit switch in the panel makes the cost
+# visible and the timing the user's choice.
+SD_UNITS = {"sd": "sd-server.service"}
+
+# Stop is a SIGTERM + wait; start has to mmap the diffusion model, VAE and
+# text encoder and can legitimately take a while on a cold page cache. The
+# timeout is generous for that and only bounds the wait for *systemctl* itself
+# (the unit keeps starting in the background either way).
+SD_CONTROL_TIMEOUT = 90
+
+
+def _sd_env() -> dict:
+    """Environment for the systemctl calls, pinned to the login session."""
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    return env
+
+
+async def _systemctl(*args: str) -> dict:
+    """Runs `systemctl --user <args>` and reports what it said.
+
+    Never raises: every failure mode (no systemd, unit missing, permission
+    problem) comes back as {"ok": False, "error": ...} so the switch can show
+    the real reason instead of a generic failure.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "--user", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_sd_env(),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"could not run systemctl: {exc}"}
+
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=SD_CONTROL_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {"ok": False, "error": "systemctl did not return in time"}
+
+    text = (out or err).decode(errors="replace").strip()
+    if proc.returncode != 0:
+        return {"ok": False, "error": text[:300] or f"systemctl exited {proc.returncode}"}
+    return {"ok": True, "output": text[:300]}
+
+
+async def _unit_state(unit: str) -> dict:
+    """ActiveState / SubState / UnitFileState for one unit, in one call.
+
+    `show` prints `Key=Value` lines; a unit that does not exist on this system
+    comes back with empty values and a non-zero exit, which is reported as
+    `available: False` rather than as an error — the switch then renders as
+    unavailable instead of broken.
+    """
+    result = await _systemctl("show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "UnitFileState")
+    if not result.get("ok"):
+        return {"active": False, "available": False, "error": result.get("error")}
+
+    fields = dict(
+        line.split("=", 1)
+        for line in str(result.get("output", "")).splitlines()
+        if "=" in line
+    )
+    active_state = fields.get("ActiveState", "")
+    if not active_state:
+        return {"active": False, "available": False}
+
+    return {
+        "active": active_state in ("active", "activating", "reloading"),
+        "available": True,
+        "enabled": fields.get("UnitFileState") == "enabled",
+        "state": active_state,
+        # "running" vs "start" vs "exited" — a one-shot unit can be "active
+        # (exited)", which must not read as a live server.
+        "sub_state": fields.get("SubState", ""),
+    }
+
+
+async def sd_server_status(request: Request) -> JSONResponse:
+    unit = SD_UNITS["sd"]
+    state = await _unit_state(unit)
+    # The HTTP probe and the unit state disagree in one telling case: the unit
+    # is active but the server is still loading weights, or it is up but
+    # unreachable because it failed to bind. Reporting both lets the switch
+    # say "starting…" instead of flipping on before the server can answer.
+    async with httpx.AsyncClient() as client:
+        response = await _sd_status(client)
+    return JSONResponse({"unit": unit, **state, "server": response})
+
+
+async def sd_server_control(request: Request) -> JSONResponse:
+    unit = SD_UNITS["sd"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "expected JSON body"}, status_code=400)
+
+    action = str(body.get("action", "")).lower()
+    if action not in ("start", "stop", "restart"):
+        return JSONResponse(
+            {"ok": False, "error": "action must be start, stop or restart"}, status_code=400
+        )
+
+    result = await _systemctl(action, unit)
+    # systemctl returns as soon as the job is queued for start (the unit is
+    # still `activating` while weights load), so the state read back here is
+    # the honest one and the frontend polls for the rest.
+    state = await _unit_state(unit)
+    status = 200 if result.get("ok") else 500
+    return JSONResponse({"action": action, "unit": unit, **state, **result}, status_code=status)
 
 
 async def dashboard(request):
@@ -544,12 +732,80 @@ def _usage_counts(usage_file: Path, registered: str) -> tuple[int, int, int]:
         return 0, 0, 0
 
 
+async def opencode_plan_usage(request: Request) -> JSONResponse:
+    """Live OpenCode Go plan allowance, straight from OpenCode's own API.
+
+    Unlike /api/opencode/usage (a local request count against hand-read
+    estimates), this queries GET /usage on the Go endpoint, which returns the
+    real three-window allowance: rolling 5h, weekly and monthly, each with a
+    percent used and a reset timestamp. Still in plan mode, so \"plan mode
+    usage\" here means the Go plan's windows.
+
+    Read-through cached for OPENCODE_PLAN_TTL_S: the panel polls every 4s and
+    this endpoint is a third-party call — without the cache the sidebar would
+    hammer opencode.ai 900 times an hour for a figure that moves slowly. The
+    cache stores the last good payload, so a transient upstream failure still
+    shows the previous numbers (flagged stale) instead of blanking the row.
+    """
+    cached = _read_json_cache(OPENCODE_PLAN_CACHE_FILE)
+    if cached and (time.time() - cached.get("fetched_at", 0)) < OPENCODE_PLAN_TTL_S:
+        return JSONResponse({**cached, "cached": True})
+
+    key = _secret_value("opencode")
+    if not key:
+        return JSONResponse({"error": "no opencode key configured"}, status_code=404)
+
+    req = urllib.request.Request(
+        f"{OPENCODE_GO_BASE}/usage",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": OPENCODE_USER_AGENT,
+            "x-opencode-session": "panel-backend",
+            "Authorization": f"Bearer {key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read())
+    except Exception as exc:
+        if cached:
+            return JSONResponse({**cached, "cached": True, "stale": True,
+                                 "error": f"upstream failed, showing last good: {exc}"})
+        return JSONResponse({"error": f"OpenCode usage unavailable: {exc}"}, status_code=502)
+
+    # Shape: {"usage": {"rolling"|"weekly"|"monthly": {status, percent, resetsAt}}}
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return JSONResponse({"error": "unexpected usage shape", "raw": payload}, status_code=502)
+
+    out = {
+        "fetched_at": time.time(),
+        "keys": [
+            {
+                "window": name,
+                "status": (usage.get(name) or {}).get("status"),
+                "percent": round(float((usage.get(name) or {}).get("percent") or 0), 1),
+                "resets_at": (usage.get(name) or {}).get("resetsAt"),
+            }
+            for name in ("rolling", "weekly", "monthly")
+            if isinstance(usage.get(name), dict)
+        ],
+        "cached": False,
+    }
+    _write_json_cache(OPENCODE_PLAN_CACHE_FILE, out)
+    return JSONResponse(out)
+
+
 async def opencode_usage(request: Request) -> JSONResponse:
     """Local, estimated usage for one pinned OpenCode model — NOT official
     OpenCode data (see OPENCODE_5H_REQUEST_ESTIMATES's docstring for why
     none exists). `model` query param is the router-registered id
     ("opencode/<sanitized-real-id>"), matching what the web UI's context
-    gauge already has as gauge.activeModelId."""
+    gauge already has as gauge.activeModelId.
+
+    Superseded for the sidebar by /api/opencode/plan-usage (the real Go plan
+    allowance); kept because the per-model request count it returns is the
+    only per-model figure available and the chat badge still reads it."""
     registered = request.query_params.get("model", "")
     resolved = _resolve_registered_model(registered)
     if resolved is None or resolved[0] != "opencode":
@@ -1467,6 +1723,59 @@ def _context_limit_for(registered_id: str) -> int | None:
     return _load_context_limits().get(registered_id)
 
 
+async def _openrouter_context_length(real_id: str) -> int | None:
+    """The context_length OpenRouter's own catalog publishes for a model —
+    usable for pins of EVERY provider, not just OpenRouter itself: several
+    OpenCode/NIM models exist in the catalog under the same slug (kimi-k3,
+    nemotron-3-super-120b-a12b, deepseek-v4-pro...). OpenRouter is the only
+    provider discovered so far that publishes context_length at all, which is
+    what makes it the single-site source.
+
+    Match rules, deliberately strict — a wrong number is worse than none:
+      1. exact slug match (row id == real id), e.g. trying OpenRouter's
+         id for a NIM pin whose real id is identical;
+      2. vendor-prefixed match: '<vendor>/<real_id>' — OpenRouter names its
+         rows 'deepseek/deepseek-v4.1-flash' while callers pass just
+         'deepseek-v4.1-flash'.
+    Variant names are knowingly NOT normalized away: glm-5.3-prime's 1M must
+    never be adopted by glm-5.3-flash, a different model on a different
+    provider. A learned value (from the relay's overflow path) always takes
+    priority upstream of this; a catalog hit is a starting point that stays
+    correct only while the catalog stays correct.
+    """
+    try:
+        if _openrouter_cache["data"] is None:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(OPENROUTER_MODELS_URL, timeout=15)
+                resp.raise_for_status()
+                _openrouter_cache["data"] = resp.json()
+                _openrouter_cache["at"] = time.monotonic()
+
+        def ctx_of(row: dict) -> int | None:
+            ctx = row.get("context_length") or (row.get("top_provider") or {}).get("context_length")
+            if isinstance(ctx, (int, float)) and ctx > 0:
+                return int(ctx)
+            return None
+
+        rows = _openrouter_cache["data"].get("data", [])
+        for row in rows:
+            if isinstance(row, dict) and row.get("id") == real_id:
+                got = ctx_of(row)
+                if got:
+                    return got
+        # vendor-prefixed variant: real id is the row name without its vendor
+        for row in rows:
+            if isinstance(row, dict) and not isinstance(row.get("id"), str):
+                continue
+            if row["id"].split("/", 1)[-1] == real_id and "/" in row["id"]:
+                got = ctx_of(row)
+                if got:
+                    return got
+    except Exception:
+        pass
+    return None
+
+
 def _parse_token_limit_error(error_body: bytes) -> tuple[int, int] | None:
     """OpenCode Go words an overflow as
     "exceeded model token limit: 262144 (requested: 315279)" — extract
@@ -1483,6 +1792,375 @@ def _parse_token_limit_error(error_body: bytes) -> tuple[int, int] | None:
     except Exception:
         pass
     return None
+
+
+# --- Background tasks ------------------------------------------------------
+#
+# What the panel can see of work that is happening but has not finished: the
+# remote relay (its own log lines already record every upstream request), the
+# model loads the router reports, and the systemd units behind them. This
+# exists because the failure mode it addresses is invisible by default — a
+# /compact that fans out into dozens of sequential model calls, or a relay
+# stuck in its repair loop, both look exactly like an idle UI.
+
+# Every relay line this endpoint understands, newest-first. The relay already
+# prints these (see remote_chat_completions); nothing new is logged for the
+# sake of this panel, so the endpoint stays correct as long as the messages do.
+_TASK_LOG_UNIT = "mcp-panel-backend"
+
+# A relay request that has not produced a *newer* line for this long is
+# treated as finished rather than running: the relay prints one line per
+# upstream attempt, so a gap this wide means either it succeeded silently or
+# it died, and neither is still "in progress".
+_TASK_STALE_SECONDS = 45
+
+# The only lines that mean the relay is RETRYING rather than progressing.
+# Taken verbatim from remote_chat_completions' own print calls:
+#   "{model!r} rejected {note}; retrying ({repair_attempts})"   (line ~2100)
+#   "{model!r} rejected before streaming: HTTP {status}: ..."    (line ~2129)
+#   "{model!r} rejected the history shape but nothing repairable..."
+# An earlier version of this endpoint instead inferred a loop from the
+# message count growing across attempts. That was wrong and produced a false
+# alarm on a perfectly healthy conversation: a multi-turn agentic chat adds
+# messages every turn, so "attempts > 1 and count grew" describes normal use
+# exactly as well as it describes a stuck retry. Growing history is now
+# treated as ordinary, and a loop requires an actual rejection in the log.
+_RELAY_REJECT_PATTERNS = (
+    re.compile(r"rejected .*; retrying \((\d+)\)"),
+    re.compile(r"rejected before streaming: HTTP (\d+)"),
+    re.compile(r"rejected the history shape"),
+)
+
+
+def _journal_lines(unit: str, since: str = "-15min", limit: int = 400) -> list[str]:
+    """journalctl output as a list, or [] when journalctl is unavailable.
+
+    Never raises: this is a diagnostic surface, and a machine without
+    journald (or with the unit renamed) should show an empty task list rather
+    than break the whole dashboard."""
+    try:
+        proc = subprocess.run(
+            ["journalctl", "--user", "-u", unit, "--since", since,
+             "-n", str(limit), "--no-pager", "-o", "cat"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            return []
+        return proc.stdout.splitlines()
+    except Exception:
+        return []
+
+
+def _relay_tasks(lines: list[str]) -> list[dict]:
+    """Fold the relay's request lines into one row per (provider, model).
+
+    The relay prints "[{provider} relay] -> '{model}': N messages, tools=[...]"
+    once per upstream attempt, and prints a separate "rejected ..." line only
+    when an attempt failed and is being repaired. Those rejection lines are the
+    sole basis for `looping`: several turns of one conversation look identical
+    to several retries of one request from the message count alone, so the
+    count is reported but never used to decide that something is stuck.
+    """
+    request_re = re.compile(r"\[(\w+) relay\] -> '([^']+)': (\d+) messages, tools=(\S+)")
+    reject_re = re.compile(r"\[(\w+) relay\] '([^']+)' (rejected .*)")
+
+    seen: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+
+    def row_for(provider: str, model: str) -> dict:
+        key = (provider, model)
+        if key not in seen:
+            order.append(key)
+            seen[key] = {
+                "kind": "relay",
+                "provider": provider,
+                "model": model,
+                "messages": 0,
+                "first_messages": 0,
+                "turns": 0,
+                "rejections": 0,
+                "last_rejection": None,
+                "tools": None,
+            }
+        return seen[key]
+
+    for line in lines:
+        rm = request_re.search(line)
+        if rm:
+            row = row_for(rm.group(1), rm.group(2))
+            count, tools = int(rm.group(3)), rm.group(4)
+            if row["turns"] == 0:
+                row["first_messages"] = count
+            row["turns"] += 1
+            row["messages"] = count
+            row["tools"] = None if tools == "None" else len(tools.split(","))
+            continue
+
+        jm = reject_re.search(line)
+        if jm:
+            row = row_for(jm.group(1), jm.group(2))
+            row["rejections"] += 1
+            # kept for the tooltip: the actual reason beats a bare count
+            row["last_rejection"] = jm.group(3).strip()[:160]
+
+    rows = [seen[k] for k in order]
+    for row in rows:
+        row["grew_by"] = row["messages"] - row["first_messages"]
+        # A loop is now defined by evidence, not shape: the relay only ever
+        # emits these lines while repairing a failed attempt. Two or more on
+        # one model means repair is not converging.
+        row["looping"] = row["rejections"] >= 2
+        row["rejected"] = row["rejections"] > 0
+    return rows
+
+
+async def context_limits(request: Request) -> JSONResponse:
+    """What this backend knows about each pinned remote model's context
+    window. Keys are the registered ids (provider-prefixed, like the pin
+    listings return). Sources differ and the value must say which:
+      - "source": "learned"   — captured from an upstream token-limit error
+      - "source": "seeded"    — hand-entered, may not be verified upstream
+      - "source": "catalog"   — OpenRouter's own published context_length
+    Providers whose APIs publish nothing (OpenCode, NVIDIA NIM) show "learned"
+    only when a relay overflow has actually been seen for them, so the absence
+    of a row is an honest "this has never overflowed here", not a bug.
+    """
+    learned = _load_context_limits()
+    sizes: dict[str, dict] = {k: {"context": v, "source": "learned"} for k, v in learned.items()}
+
+    # Catalog pass: enrich every openrouter pin from its own catalog entry.
+    try:
+        rows = (_openrouter_cache.get("data") or {}).get("data", []) or []
+        if not rows:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(OPENROUTER_MODELS_URL, timeout=15)
+                resp.raise_for_status()
+                _openrouter_cache["data"] = resp.json()
+                _openrouter_cache["at"] = time.monotonic()
+            rows = (_openrouter_cache.get("data") or {}).get("data", []) or []
+        by_id = {r.get("id"): r for r in rows if isinstance(r, dict)}
+        for provider in PROVIDERS:
+            pinned = _read_pinned(provider)
+            for entry in pinned:
+                registered = _registered_id(provider, entry["id"])
+                if registered in sizes:
+                    continue
+                ctx = await _openrouter_context_length(entry["id"])
+                if ctx:
+                    sizes[registered] = {"context": ctx, "source": "catalog"}
+    except Exception:
+        pass
+
+    return JSONResponse({"models": sizes})
+
+
+# --- Self-updating system architecture --------------------------------------
+# The diagram IS fetched state: every render re-reads the routes this backend
+# registers, the MCP servers the router is configured with, and the UI
+# features that exist in the served llama.cpp tree, then emits fresh mermaid.
+# Nothing is cached, so the picture cannot drift from reality.
+
+REPO = Path("/home/murad/Documents/GitHub/llama.cpp")
+LIVE_UI = REPO / "fork" / "pkg-build" / "llama.cpp-src" / "tools" / "ui" / "src"
+MCP_SERVERS_JSON = REPO / "MCP" / "llama-mcp-servers.json"
+
+
+def _mmd(text: str) -> str:
+    """Mermaid node labels break on " and bracket-pipes; escape the obvious."""
+    return text.replace('"', "'").replace("(", "(").replace(")", ")")
+
+
+def _route_names() -> list[str]:
+    try:
+        src = Path(__file__).read_text()
+        return sorted(set(re.findall(r'Route\("([^"]+)"', src)))
+    except Exception:
+        return []
+
+
+def _mcp_servers() -> list[str]:
+    try:
+        data = json.loads(MCP_SERVERS_JSON.read_text())["mcpServers"]
+        return sorted(data.keys())
+    except Exception:
+        return []
+
+
+PANEL_FE = Path("/home/murad/Documents/GitHub/llama.cpp/panel/frontend")
+
+
+def _ui_features() -> list[tuple[str, bool]]:
+    """(label, present) probes against the LIVE served UI tree and the panel
+    frontend. Explicit paths only: no fuzzy rglob, no prompt guessing, so a
+    positive is a real file that ships."""
+    live = LIVE_UI
+    panel = PANEL_FE
+    checks = [
+        ("/compact + auto-prune", [
+            live / "lib/constants/compaction.constants.ts",
+            panel / "chat-commands/index.ts",
+        ]),
+        ("summary sanity guard", [
+            live / "lib/constants/compaction.constants.ts",
+        ]),
+        ("/delete + /prune commands", [
+            panel / "chat-commands/message-deletion.ts",
+        ]),
+        ("/incognito chats", [
+            live / "lib/stores/incognito-chat.svelte.ts",
+        ]),
+        ("Projects", [
+            panel / "projects/ProjectsPanel.svelte",
+        ]),
+        ("panel slash commands", [
+            panel / "chat-commands/index.ts",
+        ]),
+        ("right-bar Background Tasks", [
+            panel / "RightBar.svelte",
+        ]),
+        ("/rag pages", [
+            live / "routes/rag/+page.svelte",
+            panel / "RagPage.svelte",
+        ]),
+        ("image paste -> path", [
+            live / "lib/hooks/use-chat-screen-file-upload.svelte.ts",
+        ]),
+    ]
+    out: list[tuple[str, bool]] = []
+    for label, paths in checks:
+        present = False
+        for p in paths:
+            if p.exists() and needle_text_ok(p):
+                present = True
+                break
+        out.append((label, present))
+    return out
+
+
+def needle_text_ok(p: Path) -> bool:
+    """Some checks need content, not just existence: RightBar must contain
+    the Background Tasks loader (refreshTasks), and compaction constants the
+    guard. Everything else passes on existence."""
+    name = p.name
+    if name == "RightBar.svelte":
+        return "refreshTasks" in p.read_text(errors="ignore")
+    if name == "compaction.constants.ts" and "MIN_SUMMARY_LENGTH_RATIO" in p.read_text(errors="ignore"):
+        return True
+    return True
+
+
+def _learned_limits() -> dict[str, int]:
+    try:
+        return _load_context_limits()
+    except Exception:
+        return {}
+
+
+async def architecture_mmd(request: Request):
+    """Regenerate the mermaid system diagram from live state. GET returns
+    text/plain source; ?fmt=html returns a self-contained page that renders
+    it via mermaid.js from jsDelivr."""
+    routes = _route_names()
+    mcps = _mcp_servers()
+    feats = _ui_features()
+    learned = _learned_limits()
+
+    relay_rows = _relay_tasks(_journal_lines(_TASK_LOG_UNIT))
+    active_relays = [r["provider"] for r in relay_rows][:4]
+
+    api_routes = [r for r in routes if r.startswith("/api/")]
+    api_labels = ", ".join(sorted(set(r.replace("/api/", "") for r in api_routes))[:12])
+
+    feat_parts = []
+    for i, (flabel, fok) in enumerate(feats):
+        state = "on" if fok else "absent"
+        feat_parts.append(f"    F{i}[\"{_mmd(flabel)}<br/>{state}\"]")
+    feat_lines = chr(10).join(feat_parts)
+
+    limits_line = ", ".join(f"{k.split('/')[-1]}: {v // 1024}k" for k, v in list(learned.items())[:5]) or "none learned yet"
+    relay_line = ", ".join(sorted(set(active_relays))) or "idle"
+
+    mmd = f"""flowchart LR
+    subgraph WEBUI["llama.cpp web ui (llama.cpp, hash-routed, PWA)"]
+{feat_lines}
+    end
+
+    subgraph ROUTER["assist-server :8080 (proxy + static UI)"]
+        R1["v1/chat/completions"]
+        R2["static UI broadcast: built UI serving"]
+    end
+
+    subgraph SERVERS["MCP servers (bridged)"]
+{chr(10).join(f'        M{i}["{_mmd(name)}"]' for i, name in enumerate(mcps))}
+    end
+
+    subgraph PANEL["panel backend :9010"]
+        P1["Relays: {relay_line}"]
+        P2["Context limits: learned + OpenRouter catalog<br/>{_mmd(limits_line)}"]
+        P3["/api endpoints:<br/>{_mmd(api_labels[:200])}"]
+    end
+
+    subgraph STORE["Storage"]
+        S1[("IndexedDB LlamaUi<br/>conversations + messages")]
+        S2[("~/.config/mcp-secrets<br/>keys, pins, learned limits")]
+    end
+
+    WEBUI --> ROUTER
+    ROUTER --> SERVERS
+    ROUTER --> PANEL
+    PANEL --> STORE
+    WEBUI --> STORE
+
+    classDef warn fill:#7f1d1d,stroke:#7f1d1d,color:#fff;
+    classDef ok fill:#14532d,stroke:#14532d,color:#fff;
+"""
+
+    if request.query_params.get("fmt") == "html":
+        escaped = mmd.replace("&", "&amp;").replace("<", "&lt;")
+        html = ("""<!doctype html><html><head><meta charset="utf-8">
+<title>llama.cpp integrations — live architecture</title>
+<style>body{margin:0;padding:24px;background:#0b0f14;color:#dbe2ea;font-family:system-ui,sans-serif}h1{font-size:16px;font-weight:500}.mmd{background:#0b0f14;color:#dbe2ea}</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head><body><h1>llama.cpp integrations — live architecture</h1>
+<pre class="mermaid mmd">""" + escaped + "</pre>"
+        "<script>mermaid.initialize({startOnLoad:true,theme:'dark'});</script></body></html>")
+        return Response(html, media_type="text/html")
+
+    return Response(mmd, media_type="text/plain")
+
+async def background_tasks(request: Request) -> JSONResponse:
+    """In-flight work worth watching while debugging /compact and the relays.
+
+    Deliberately read-only and best-effort: every source is optional, and a
+    source that fails contributes nothing rather than failing the request.
+    The panel polls this on its normal dashboard cadence.
+    """
+    relay = _relay_tasks(_journal_lines(_TASK_LOG_UNIT))
+
+    models: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(4.0, connect=3.0)) as client:
+            listing = await _llama_models(client)
+        for entry in listing.get("models", []) or []:
+            state = entry.get("state") or entry.get("status")
+            if state in ("loading", "downloading"):
+                models.append({
+                    "kind": "model_load",
+                    "model": entry.get("id") or entry.get("name"),
+                    "state": state,
+                    "progress": entry.get("progress"),
+                })
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "tasks": relay + models,
+        "relay": relay,
+        "model_loads": models,
+        "context_limits": _load_context_limits(),
+        "generated_at": time.time(),
+        "stale_after_seconds": _TASK_STALE_SECONDS,
+    })
 
 
 def _registered_id(provider: str, real_id: str) -> str:
@@ -2033,8 +2711,27 @@ async def router_props(request: Request) -> JSONResponse:
     CONTEXT_LIMITS_FILE) — otherwise the gauge stays empty and the user
     only learns the window exists by overflowing it at request time."""
     registered = str(request.query_params.get("model", ""))
+    # Resolution order for n_ctx: (1) a limit learned from an upstream "exceeded
+    # model token limit" error — the ground truth, taken from upstream's own
+    # message; (2) if this is an OpenRouter pin, the context_length its catalog
+    # publishes — authoritative and free, so most pins never need learning at
+    # all; (3) 0, which the web UI's getModelContextSize treats as unknown and
+    # falls back on, and which keeps this endpoint's contract of always
+    # answering 200 with a real body.
+    n_ctx = _context_limit_for(registered)
+    if not n_ctx:
+        try:
+            resolved = _resolve_registered_model(registered)
+        except Exception:
+            resolved = None
+        if resolved:
+            provider, real_id = resolved
+            # every provider tries the OpenRouter catalog first — exact-slug
+            # matches only, so providers whose ids diverge (e.g. glm-5.3-flash)
+            # stay unknown rather than inheriting a different variant's number
+            n_ctx = await _openrouter_context_length(real_id)
     return JSONResponse({
-        "default_generation_settings": {"params": {}, "n_ctx": _context_limit_for(registered) or 0},
+        "default_generation_settings": {"params": {}, "n_ctx": n_ctx or 0},
         "model_path": "",
         "model_alias": registered,
         "build_info": "",
@@ -2167,14 +2864,20 @@ async def rag_delete_document(request: Request) -> JSONResponse:
 app = Starlette(
     routes=[
         Route("/api/dashboard", dashboard),
+        Route("/api/sd-server", sd_server_status, methods=["GET"]),
+        Route("/api/sd-server/control", sd_server_control, methods=["POST"]),
         Route("/api/openrouter/models", openrouter_models),
         Route("/api/nim/models", nim_models),
         Route("/api/nim/usage", nim_usage),
         Route("/api/provider-usage", provider_usage),
         Route("/api/usage-summary", usage_summary),
         Route("/api/usage-history", usage_history),
+        Route("/api/background-tasks", background_tasks),
+        Route("/api/context-limits", context_limits),
+        Route("/api/architecture.mmd", architecture_mmd),
         Route("/api/opencode/models", opencode_models),
         Route("/api/opencode/usage", opencode_usage),
+        Route("/api/opencode/plan-usage", opencode_plan_usage),
         Route("/nim-usage", nim_usage_page),
         Route("/opencode-usage", opencode_usage_page),
         Route("/openrouter-usage", openrouter_usage_page),

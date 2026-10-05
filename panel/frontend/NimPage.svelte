@@ -11,10 +11,12 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import * as Table from '$lib/components/ui/table';
+	import ProviderUsagePanel from './ProviderUsagePanel.svelte';
 	import { onMount } from 'svelte';
 
 	const MODELS_URL = 'http://127.0.0.1:9010/api/nim/models';
 	const PINNED_URL = 'http://127.0.0.1:9010/api/nim/pinned';
+	const CONTEXT_LIMITS_URL = 'http://127.0.0.1:9010/api/context-limits';
 	const PIN_URL = 'http://127.0.0.1:9010/api/nim/pin';
 	const UNPIN_URL = 'http://127.0.0.1:9010/api/nim/unpin';
 
@@ -63,6 +65,36 @@
 	let pinBusy = $state<Record<string, boolean>>({});
 	let pinError = $state('');
 
+	/**
+	 * Context windows we know for pinned NIM models, keyed by the registered
+	 * id the router uses (`nim/<real id with any / as __>`). NVIDIA's own API
+	 * publishes no context field, so a value here comes only from a real
+	 * overflow being observed by the panel relay - where none is known the
+	 * column shows an honest dash rather than a figure.
+	 */
+	let contextLimits: Record<string, { context: number; source: string }> = $state({});
+
+	function registeredId(realId: string): string {
+		return 'nim/' + realId.replace(/\//g, '__');
+	}
+
+	function contextLabel(realId: string): string {
+		const hit = contextLimits[registeredId(realId)];
+		if (!hit) return '-';
+		return hit.context >= 1000 ? `${Math.round(hit.context / 1000)}k` : String(hit.context);
+	}
+
+	async function loadContextLimits() {
+		try {
+			const res = await fetch(CONTEXT_LIMITS_URL, { signal: AbortSignal.timeout(6000) });
+			const body: { models: Record<string, { context: number; source: string }> } =
+				await res.json();
+			contextLimits = body.models ?? {};
+		} catch {
+			// the column is auxiliary; a dead backend just leaves dashes
+		}
+	}
+
 	async function loadPinned() {
 		try {
 			const res = await fetch(PINNED_URL, { signal: AbortSignal.timeout(6000) });
@@ -102,6 +134,7 @@
 		void load();
 		loadFavorites();
 		void loadPinned();
+		void loadContextLimits();
 	});
 
 	async function copyId(id: string) {
@@ -129,6 +162,13 @@
 </script>
 
 <div class="mx-auto flex max-w-4xl flex-col gap-4 p-6">
+	<!-- Usage for this provider, above the catalog — shared with the
+	     OpenCode page via ProviderUsagePanel, which also documents why
+	     each provider gets a different shape (this one has no published usage figure at all). -->
+	<ProviderUsagePanel title="NVIDIA NIM requests"
+		url="http://127.0.0.1:9010/api/usage-summary"
+		provider="nim" />
+
 	<div>
 		<h1 class="text-lg font-medium text-foreground">NVIDIA NIM models</h1>
 		<p class="text-sm text-muted-foreground">
@@ -183,6 +223,7 @@
 				<Table.Row>
 					<Table.Head class="w-8"></Table.Head>
 					<Table.Head>Model</Table.Head>
+					<Table.Head class="text-right">Context</Table.Head>
 					<Table.Head></Table.Head>
 				</Table.Row>
 			</Table.Header>
@@ -204,6 +245,9 @@
 							>
 								{favorites.has(model.id) ? '★' : '☆'}
 							</button>
+						</Table.Cell>
+						<Table.Cell class="text-right text-sm tabular-nums text-muted-foreground">
+							{contextLabel(model.id)}
 						</Table.Cell>
 						<Table.Cell>
 							<span class="text-sm text-foreground"

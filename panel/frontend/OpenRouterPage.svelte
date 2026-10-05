@@ -11,6 +11,7 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import * as Table from '$lib/components/ui/table';
+	import ProviderUsagePanel from './ProviderUsagePanel.svelte';
 	import { onMount } from 'svelte';
 
 	const MODELS_URL = 'http://127.0.0.1:9010/api/openrouter/models';
@@ -163,6 +164,13 @@
 </script>
 
 <div class="mx-auto flex max-w-4xl flex-col gap-4 p-6">
+	<!-- Usage for this provider, above the catalog — shared with the
+	     OpenCode page via ProviderUsagePanel, which also documents why
+	     each provider gets a different shape (this one has an account-wide credit figure from its own API). -->
+	<ProviderUsagePanel title="OpenRouter credits"
+		url="http://127.0.0.1:9010/api/usage-summary"
+		provider="openrouter" />
+
 	<div>
 		<h1 class="text-lg font-medium text-foreground">OpenRouter models</h1>
 		<p class="text-sm text-muted-foreground">

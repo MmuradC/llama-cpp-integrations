@@ -15,12 +15,18 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import * as Table from '$lib/components/ui/table';
+	import ProviderUsagePanel from './ProviderUsagePanel.svelte';
 	import { onMount } from 'svelte';
 
 	const MODELS_URL = 'http://127.0.0.1:9010/api/opencode/models';
 	const PINNED_URL = 'http://127.0.0.1:9010/api/opencode/pinned';
+	const CONTEXT_LIMITS_URL = 'http://127.0.0.1:9010/api/context-limits';
 	const PIN_URL = 'http://127.0.0.1:9010/api/opencode/pin';
 	const UNPIN_URL = 'http://127.0.0.1:9010/api/opencode/unpin';
+	// Live Go plan allowance: rolling 5h / weekly / monthly, straight from
+	// OpenCode's own GET /usage (proxied by the panel backend, so the key never
+	// reaches the browser). Same endpoint the right bar's OpenCode row reads.
+	const PLAN_USAGE_URL = 'http://127.0.0.1:9010/api/opencode/plan-usage';
 
 	type OpenCodeModel = { id: string };
 
@@ -65,6 +71,35 @@
 
 	let pinnedIds = $state<Set<string>>(new Set());
 	let pinBusy = $state<Record<string, boolean>>({});
+	/**
+	 * Context windows we know for pinned OpenCode models, keyed by the
+	 * registered id the router uses. OpenCode publishes no context field, so
+	 * values exist only where the panel relay has seen an actual overflow -
+	 * a dash is an honest unknown, not an error.
+	 */
+	let contextLimits: Record<string, { context: number; source: string }> = $state({});
+
+	function registeredId(realId: string): string {
+		return 'opencode/' + realId.replace(/\//g, '__');
+	}
+
+	function contextLabel(realId: string): string {
+		const hit = contextLimits[registeredId(realId)];
+		if (!hit) return '-';
+		return hit.context >= 1000 ? `${Math.round(hit.context / 1000)}k` : String(hit.context);
+	}
+
+	async function loadContextLimits() {
+		try {
+			const res = await fetch(CONTEXT_LIMITS_URL, { signal: AbortSignal.timeout(6000) });
+			const body: { models: Record<string, { context: number; source: string }> } =
+				await res.json();
+			contextLimits = body.models ?? {};
+		} catch {
+			// auxiliary column; backend unreachable just leaves dashes
+		}
+	}
+
 	let pinError = $state('');
 
 	async function loadPinned() {
@@ -106,6 +141,7 @@
 		void load();
 		loadFavorites();
 		void loadPinned();
+		void loadContextLimits();
 	});
 
 	async function copyId(id: string) {
@@ -133,6 +169,17 @@
 </script>
 
 <div class="mx-auto flex max-w-4xl flex-col gap-4 p-6">
+	<!-- Live Go plan allowance above the catalog: it is the one figure that
+	     decides whether to reach for a hosted model at all. Shared with the
+	     OpenRouter and NIM pages via ProviderUsagePanel — see its header for
+	     why one component carries all three providers' shapes. -->
+	<ProviderUsagePanel
+		title="Go plan allowance"
+		url={PLAN_USAGE_URL}
+	/>
+
+	<ProviderKeySection provider="opencode" />
+
 	<div>
 		<h1 class="text-lg font-medium text-foreground">OpenCode models</h1>
 		<p class="text-sm text-muted-foreground">
@@ -162,24 +209,6 @@
 		</button>
 	</div>
 
-	<!-- Skip the list entirely — copy any id you already know without
-	     needing it to be its own row. -->
-	<div class="flex items-center gap-2">
-		<Input
-			placeholder="Or type an exact model id, e.g. kimi-k3"
-			class="text-sm"
-			bind:value={manualId}
-			onkeydown={(e) => e.key === 'Enter' && copyId(manualId.trim())}
-		/>
-		<Button
-			size="sm"
-			variant="secondary"
-			disabled={!manualId.trim()}
-			onclick={() => copyId(manualId.trim())}
-		>
-			{copiedId && copiedId === manualId.trim() ? 'Copied!' : 'Copy'}
-		</Button>
-	</div>
 
 	{#if models}
 		<Table.Root>
@@ -187,6 +216,7 @@
 				<Table.Row>
 					<Table.Head class="w-8"></Table.Head>
 					<Table.Head>Model</Table.Head>
+					<Table.Head class="text-right">Context</Table.Head>
 					<Table.Head></Table.Head>
 				</Table.Row>
 			</Table.Header>
@@ -213,6 +243,9 @@
 							<span class="text-sm text-foreground"
 								>{copiedId === model.id ? 'Copied!' : model.id}</span
 							>
+						</Table.Cell>
+						<Table.Cell class="text-right text-sm tabular-nums text-muted-foreground">
+							{contextLabel(model.id)}
 						</Table.Cell>
 						<Table.Cell class="text-right">
 							<Button

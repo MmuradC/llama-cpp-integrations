@@ -326,13 +326,30 @@ def lines_result(lines: list[str]) -> dict:
 
 
 def code_result(code: str) -> dict:
-    """The finished diagram, as a ```mermaid fence the Web UI renders inline."""
+    """The finished diagram, as a ```mermaid fence the Web UI renders inline.
+
+    The trailing output rule is load-bearing, measured 2026-09-27: an opencode
+    deepseek-v4.1 chat that received the raw 1,769-char architecture fence
+    discarded it and replied with 170 chars of ASCII deco (`──►`, no
+    flowchart header), which the chat's mermaid renderer rejected as
+    "Syntax error in text". The same chat given the explicit verbatim rule
+    below emitted all 1,769 characters byte-for-byte. Models treat tool
+    results as loose source material by default, so the rule names the exact
+    failure (shortening, ASCII arrows, re-labeling) rather than a vague
+    "pass it on".
+    """
     return {
         "content": [{
             "type": "text",
             "text": f"```mermaid\n{code.strip()}\n```\n"
                     "Show this block to the user as-is — do not describe it, "
-                    "re-type it, or claim it was saved anywhere.",
+                    "re-type it, or claim it was saved anywhere.\n\n"
+                    "MANDATORY OUTPUT RULE: your reply must contain exactly "
+                    "the fenced mermaid block above, verbatim, "
+                    "character-for-character. Do not shorten, re-draw, "
+                    "translate into ASCII art, re-label nodes, or add arrows "
+                    "like ──►. You may add nothing before or after except an "
+                    "empty line. The renderer errors on re-drawn text.",
         }]
     }
 
@@ -383,7 +400,30 @@ def mermaid_pick(request: str) -> dict:
 
     Return the best-matching type with starter syntax when the request is
     clear, or the top few candidates to choose between when it is ambiguous.
+
+    Hard steering first, before any ranking: requests about llama.cpp's own
+    integration - its system architecture, what is wired where, the MCP/
+    panel/router layout - must answered with the live fetcher tool
+    (mermaid_architecture), not a hand-composed type. A hand-made diagram
+    goes stale the moment a file moves; the fetcher's only source is a
+    real-time regeneration, which is why this is a rule and not a hint.
     """
+    lowered = request.lower()
+    if any(term in lowered for term in (
+        "system architecture", "integration architecture",
+        "how is my setup", "what is wired", "llama.cpp integrations",
+        "be the architecture diagram of this setup",
+    )):
+        return {
+            "tool_transfer": "mermaid_architecture",
+            "reason": (
+                "This looks like a request about the llama.cpp integration "
+                "itself. Use the mermaid_architecture tool instead - it "
+                "regenerates the diagram from the actual machine each call, "
+                "so what the user sees reflects real registered state, not "
+                "a possibly stale description."
+            ),
+        }
     if not request.strip():
         return lines_result(["Empty request — describe what should be drawn."])
     ranked = ranked_types(request)
@@ -452,6 +492,59 @@ def mermaid_chart(type_id: str, code: str) -> dict:
             ["Mermaid render failed:"] + [f"  - {e}" for e in errors]
             + ["Fix the code and call mermaid_chart again.", "", code]
         )
+    return code_result(code)
+
+
+ARCH_URL = (
+    os.environ.get(
+        "MERMAID_ARCHITECTURE_URL",
+        "http://127.0.0.1:9010/api/architecture.mmd",
+    ).rstrip("/")
+)
+
+
+@mcp.tool()
+def mermaid_architecture() -> dict:
+    """THE system-architecture diagram, regenerated live from the actual
+    machine each call - felibriage, but real: the panel backend reads its own
+    registered API routes, the MCP server list from llama-mcp-servers.json,
+    the UI feature files in the served llama.cpp tree, the learned context
+    limits, and the relay's live journal lines, then emits the flowchart. Use
+    this instead of composing an architecture diagram by hand whenever the
+    request is about llama.cpp's own integration layout, since only this
+    cannot drift from reality: hand-built diagrams go stale the moment a file
+    moves, this one is a portrait fetched at call time.
+
+    Returns:
+        The finished mermaid in a fenced block, ready for the chat to render.
+        The panel backend must be running (systemctl --user status
+        mcp-panel-backend) for a fetch; otherwise the error text says so and
+        no fallback guess is made - a stale or invented diagram would defeat
+        the point of the tool existing.
+    """
+    try:
+        import httpx
+
+        resp = httpx.get(ARCH_URL, timeout=15)
+        resp.raise_for_status()
+        code = resp.text.strip()
+    except Exception as exc:
+        return {
+            "error": (
+                "could not fetch the live architecture from "
+                f"{ARCH_URL} ({exc}) - is mcp-panel-backend running? Nothing "
+                "is invented to take its place: the whole point of this tool "
+                "is that its answer is the machine's real state."
+            )
+        }
+
+    errors = validate_code("flowchart", code)
+    if errors:
+        return {
+            "error": "the backend returned a mermaid that no longer validates: " + "; ".join(errors),
+            "raw": code,
+        }
+
     return code_result(code)
 
 

@@ -43,7 +43,8 @@
  *     where that patch's `chatStore.compactConversation` is present. Rather
  *     than statically importing it (which would fail to build in a tree
  *     without it) the command probes for it at runtime and stays disabled
- *     when it is absent.
+ *     when it is absent. `/prune` is the storage-side counterpart of the
+ *     same patch and is written to the same rule.
  */
 
 import { browser } from '$app/environment';
@@ -55,6 +56,7 @@ import {
 	ROUTES
 } from '$lib/constants';
 import { ChatFormCommandAction, MessageRole } from '$lib/enums';
+import { DatabaseService } from '$lib/services/database.service';
 import { RouterService } from '$lib/services/router.service';
 import {
 	chatStore,
@@ -68,7 +70,18 @@ import {
 import { incognitoChatStore } from '$lib/stores/incognito-chat.svelte';
 import { INCOGNITO_SUMMARY, startIncognitoChat } from '../incognito';
 import type { PermissionMode } from '$lib/types/agentic';
-import type { ChatFormCommand } from '$lib/types';
+import type { ChatFormCommand, DatabaseConversation } from '$lib/types';
+import {
+	describeSize,
+	formatChars,
+	parseDeleteArgs,
+	planInPlaceDelete,
+	planPruneToSummary,
+	planTailDelete,
+	previewOf,
+	type DeletableMessage,
+	type DeletionPlan
+} from './message-deletion';
 import { copyToClipboard, formatMessageForClipboard } from '$lib/utils';
 // Icons and the toast helper come from an in-tree shim rather than straight
 // from `@lucide/svelte` and `svelte-sonner`: this file lives outside tools/ui,
@@ -90,11 +103,13 @@ import {
 	PencilLine,
 	Plug,
 	Receipt,
+	Scissors,
 	Settings,
 	ShieldCheck,
 	Square,
 	SquarePen,
-	toast
+	toast,
+	Trash2
 } from '$lib/utils/panel-command-runtime';
 import type { Component } from 'svelte';
 
@@ -143,7 +158,14 @@ interface PanelDashboard {
 }
 
 /** The shape `/compact` needs, probed at runtime — see the module docstring. */
-type CompactRunner = () => Promise<{ error?: string; ok: boolean }>;
+type CompactRunner = () => Promise<{
+	error?: string;
+	ok: boolean;
+	/** Sizes reported by chatStore.compactConversation on success, so the
+	 * toast can state what happened in numbers instead of a bare "done". */
+	originalChars?: number;
+	summaryChars?: number;
+}>;
 
 /** The conversation the chat form is showing, if any. */
 function activeConversationId(): string | null {
@@ -182,6 +204,169 @@ function isGenerating(): boolean {
 function compactRunner(): CompactRunner | undefined {
 	return (chatStore as unknown as { compactConversation?: CompactRunner })
 		.compactConversation;
+}
+
+/**
+ * What `/delete` and `/prune` plan against: the active branch (what the user
+ * can see), the whole conversation (a cascade reaches branch variants the user
+ * cannot see) and the compaction pointer. Null when no conversation is open.
+ */
+interface DeletionContext {
+	convId: string;
+	all: DeletableMessage[];
+	activePath: DeletableMessage[];
+	compactionPoint?: string;
+	currentNodeId?: string | null;
+}
+
+async function deletionContext(): Promise<DeletionContext | null> {
+	const convId = activeConversationId();
+
+	if (!convId) return null;
+
+	return {
+		activePath: conversationsStore.activeMessages as DeletableMessage[],
+		all: (await conversationsStore.getConversationMessages(convId)) as DeletableMessage[],
+		compactionPoint: compactionPointOf(convId),
+		convId,
+		currentNodeId: conversationsStore.activeConversation?.currNode ?? null
+	};
+}
+
+/** The compaction pointer, read through a cast — see the module docstring. */
+function compactionPointOf(convId: string): string | undefined {
+	const conversation =
+		conversationsStore.activeConversation?.id === convId
+			? conversationsStore.activeConversation
+			: (conversationsStore.conversations.find((c) => c.id === convId) as
+					| DatabaseConversation
+					| undefined);
+
+	return (conversation as { compactedThroughMessageId?: string } | undefined)
+		?.compactedThroughMessageId;
+}
+
+/**
+ * Clears the compaction pointer after the summary it pointed at was deleted.
+ *
+ * Without this the conversation silently un-compacts: streamChatCompletion
+ * only trims when the pointer's message is still in the array it is handed, so
+ * a dangling pointer means the *whole* history goes back to the model on the
+ * next send — the opposite of what deleting messages to save context was for.
+ * Reached through a cast because both the field and the setter exist only
+ * where the compaction module is applied; without it there is no pointer to
+ * clear, so the no-op is correct rather than a fallback.
+ */
+async function clearCompactionPoint(convId: string): Promise<void> {
+	const setter = (
+		conversationsStore as unknown as {
+			setCompactionPoint?: (id: string, messageId: string | undefined) => Promise<void>;
+		}
+	).setCompactionPoint;
+
+	if (setter) await setter.call(conversationsStore, convId, undefined);
+}
+
+/**
+ * Removes exactly one message: its children are re-parented to its own parent
+ * and adopted in the slot it occupied.
+ *
+ * Same shape as the app's own removeSystemPromptPlaceholder — the one in-tree
+ * splice of this kind — with "the parent" in place of "the root".
+ * DatabaseService.deleteMessage already takes the id out of the parent's
+ * children array, so the adoption only has to append, and it is the same call
+ * for an incognito chat (the store intercepts it).
+ */
+async function applyInPlaceDelete(context: DeletionContext, plan: DeletionPlan): Promise<void> {
+	const [messageId] = plan.deleteIds;
+	const adoption = plan.adoptInto;
+
+	await DatabaseService.deleteMessage(messageId);
+
+	if (adoption && adoption.children.length > 0) {
+		for (const childId of adoption.children) {
+			await DatabaseService.updateMessage(childId, { parent: adoption.parentId });
+		}
+
+		const parent = context.all.find((m) => m.id === adoption.parentId);
+		const kept = (parent?.children ?? []).filter((id) => id !== messageId);
+
+		await DatabaseService.updateMessage(adoption.parentId, {
+			children: [...kept, ...adoption.children.filter((id) => !kept.includes(id))]
+		});
+	}
+
+	if (plan.dropsCompactionSummary) await clearCompactionPoint(context.convId);
+
+	if (plan.nextCurrentNode) await conversationsStore.updateCurrentNode(plan.nextCurrentNode);
+
+	await conversationsStore.refreshActiveMessages();
+	conversationsStore.updateConversationTimestamp(context.convId);
+}
+
+/**
+ * Applies a prune: delete the pre-summary messages, then re-parent the summary
+ * to the conversation root and make it the root's only child.
+ *
+ * One write per message rather than a bulk transaction, because the panel has
+ * no bulk message-delete to call (DatabaseService exposes a bulk delete for
+ * conversations only) and adding one would mean another in-tree hunk. A
+ * thousand messages is a few seconds, which the loading toast covers.
+ */
+async function applyPrune(context: DeletionContext, plan: DeletionPlan): Promise<void> {
+	const toastId = 'panel-command-prune';
+
+	toast.loading(`Removing ${plan.deleteIds.length} messages…`, {
+		description: 'One write per message, so a long conversation takes a few seconds.',
+		duration: Number.POSITIVE_INFINITY,
+		id: toastId
+	});
+
+	try {
+		for (const id of plan.deleteIds) await DatabaseService.deleteMessage(id);
+
+		const reparent = plan.reparent;
+
+		if (reparent) {
+			await DatabaseService.updateMessage(reparent.id, { parent: reparent.parentId });
+
+			if (plan.rootChildrenAfter) {
+				await DatabaseService.updateMessage(reparent.parentId, {
+					children: plan.rootChildrenAfter
+				});
+			}
+		}
+
+		if (plan.nextCurrentNode) await conversationsStore.updateCurrentNode(plan.nextCurrentNode);
+
+		await conversationsStore.refreshActiveMessages();
+		conversationsStore.updateConversationTimestamp(context.convId);
+
+		toast.success(`Pruned ${describeSize(plan.counts, plan.chars)}`, {
+			description:
+				'The compaction summary and everything after it are kept, so the next request is unchanged.',
+			id: toastId
+		});
+	} catch (error) {
+		toast.error(`Prune failed: ${error instanceof Error ? error.message : String(error)}`, {
+			id: toastId
+		});
+	}
+}
+
+/** The `/delete` help text, with the branch's own numbers so `/delete <n>` is usable. */
+function deleteUsage(context: DeletionContext): string {
+	const path = context.activePath;
+	const start = Math.max(0, path.length - 5);
+	const newest = path
+		.slice(start)
+		.map((m, i) => `#${start + i + 1} ${m.role} ${formatChars(m.content.length)}`);
+	const totalChars = path.reduce((sum, m) => sum + m.content.length, 0);
+
+	return [
+		'/delete <n> removes just that message and re-parents its replies, keeping the rest · /delete last <n> removes the newest n · /prune drops everything older than the compaction summary.',
+		`This branch: ${path.length} messages, ${formatChars(totalChars)}. Newest: ${newest.join(' · ')}`
+	].join(' ');
 }
 
 /**
@@ -303,7 +488,7 @@ const COMMANDS: PanelCommand[] = [
 					transcriptChars / 1000
 				)}k characters) with ${compactModel ?? 'the selected model'} — about ${batches} call${
 					batches === 1 ? '' : 's'
-				} to the model. Nothing is deleted, and reloading the page cancels it.`,
+				} to the model. When the summary is ready, the messages it replaced are removed automatically.`,
 				duration: Number.POSITIVE_INFINITY,
 				id: toastId
 			});
@@ -311,14 +496,223 @@ const COMMANDS: PanelCommand[] = [
 			try {
 				const result = await compact.call(chatStore);
 
+				// Kill the sticky loading toast explicitly before showing the
+				// outcome. The result toasts reuse the same id, which svelte-sonner
+				// turns into an in-place update — but the loader was created with
+				// duration: Infinity, and an in-place update can keep the old
+				// sticky timer, leaving the spinner on screen after the run has
+				// actually ended. dismiss() tears it down unconditionally, so the
+				// outcome toast stands alone and auto-dismisses normally.
+				toast.dismiss(toastId);
+
 				if (result.ok) {
-					toast.success('Conversation compacted', { id: toastId });
+					// Actual reduction, not a bare "done": until the next real reply
+					// the context gauge does not move (it reads the last assistant
+					// message's server timings, which the synthetic summary has
+					// none of), so without numbers here the command reads as
+					// having done nothing — which cost repeated re-runs.
+					const saved =
+						result.originalChars && result.summaryChars
+							? ` · transcript ${Math.round(result.originalChars / 1000)}k → summary ${Math.round(
+									result.summaryChars / 1000
+								)}k chars`
+							: '';
+
+					// Delete what the summary replaced, immediately. The user's
+					// expectation for /compact is that the transcript shrinks, not
+					// merely that the next request stops carrying the history —
+					// upstream's keep-everything choice is why the panel also has
+					// /prune, but waiting for a second command read as "compact
+					// isn't working". Same plan /prune uses: delete everything
+					// except the summary and its side, re-parent the summary to
+					// the root, branch structure kept intact.
+					// Same planner /prune uses, but importance-aware: the user's
+					// task statements, decisions, paths, and long assistant answers
+					// stay as real messages - only the chaff (greetings, one-word
+					// turns, bare tool receipts) is deleted. The summary still
+					// replaces what is sent to the model; importance retention is
+					// about what remains readable above the summary, not tokens.
+					const context = await deletionContext();
+					const prune = context
+						? planPruneToSummary(context.all, context.compactionPoint, {
+								currentNodeId: context.currentNodeId,
+								keepImportant: true
+							})
+						: null;
+
+					if (context && prune?.ok) {
+						// applyPrune runs its own loading/success/error toasts on
+						// the prune id, standing beside the compact outcome rather
+						// than overwriting it.
+						await applyPrune(context, prune.plan);
+					}
+
+					toast.success(`Conversation compacted${saved}`, {
+						description:
+							(context && prune?.ok
+								? `Removed ${prune.plan.deleteIds.length} routine messages; kept ${prune.plan.counts.total - prune.plan.deleteIds.length} important ones + the summary.`
+								: 'Old messages kept — nothing was removed.') +
+							' The context gauge updates on your next message.',
+						id: toastId
+					});
 				} else {
 					toast.error(result.error ?? 'Failed to compact the conversation', { id: toastId });
 				}
 			} catch (error) {
+				// Same explicit teardown: an exception path must not leave the
+				// sticky loader spinning either.
+				toast.dismiss(toastId);
 				toast.error(
 					`Compaction failed: ${error instanceof Error ? error.message : String(error)}`,
+					{ id: toastId }
+				);
+			}
+		}
+	},
+	{
+		description: 'Drop everything older than the compaction summary',
+		// Enabled without a compaction point on purpose: the predicate cannot
+		// tell "not compacted" from "compaction unavailable" without repeating
+		// the plan, and the body explains which of the two it is. Both are more
+		// useful than a row the user can only wonder about.
+		disabled: () =>
+			!activeConversationId() || conversationsStore.activeMessages.length === 0 || isGenerating(),
+		icon: Scissors,
+		keywords: ['trim', 'shrink', 'clean up', 'old messages', 'after compact', 'cleanup'],
+		name: 'prune',
+		run: async (args) => {
+			const confirmed = args.trim().toLowerCase().split(/\s+/).includes('confirm');
+			const context = await deletionContext();
+
+			if (!context) {
+				toast.error('No conversation is open');
+
+				return;
+			}
+
+			const plan = planPruneToSummary(context.all, context.compactionPoint, {
+				currentNodeId: context.currentNodeId
+			});
+
+			if (!plan.ok) {
+				toast.error(plan.reason);
+
+				return;
+			}
+
+			if (!confirmed) {
+				// Destructive and irreversible, so it is opt-in twice: this is the
+				// dry run, `/prune confirm` is the commit.
+				toast.message(`Would prune ${describeSize(plan.plan.counts, plan.plan.chars)}`, {
+					description:
+						'That is everything older than the compaction summary. The summary and everything after it are kept, so the next request is identical — the conversation just stops carrying (and re-summarising) its old history. Nothing is deleted yet: repeat as /prune confirm. Export first if unsure.',
+					duration: 25000
+				});
+
+				return;
+			}
+
+			await applyPrune(context, plan.plan);
+		}
+	},
+	{
+		description: 'Delete messages: /delete <n> removes one, /delete last <n> the newest',
+		disabled: () =>
+			!activeConversationId() || conversationsStore.activeMessages.length === 0 || isGenerating(),
+		icon: Trash2,
+		keywords: ['remove', 'trim', 'shrink', 'forget', 'drop', 'trash'],
+		name: 'delete',
+		run: async (args) => {
+			const parsed = parseDeleteArgs(args);
+
+			if (parsed.kind === 'error') {
+				toast.error(parsed.error);
+
+				return;
+			}
+
+			const context = await deletionContext();
+
+			if (!context) {
+				toast.error('No conversation is open');
+
+				return;
+			}
+
+			if (parsed.kind === 'usage') {
+				toast.message('Delete messages', {
+					description: deleteUsage(context),
+					duration: 20000
+				});
+
+				return;
+			}
+
+			const plan =
+				parsed.kind === 'in-place'
+					? planInPlaceDelete(context.all, context.activePath, parsed.position, {
+							compactionPoint: context.compactionPoint,
+							currentNodeId: context.currentNodeId
+						})
+					: planTailDelete(context.all, context.activePath, parsed.count, {
+							compactionPoint: context.compactionPoint
+						});
+
+			if (!plan.ok) {
+				toast.error(plan.reason);
+
+				return;
+			}
+
+			const target = plan.plan.target;
+			const described =
+				parsed.kind === 'in-place'
+					? `message #${parsed.position} of this branch — ${target.role}: “${previewOf(target)}”`
+					: `the newest ${parsed.count} message${parsed.count === 1 ? '' : 's'} of this branch, starting at #${
+							context.activePath.length - parsed.count + 1
+						} — ${target.role}: “${previewOf(target)}”`;
+			const summaryWarning = plan.plan.dropsCompactionSummary
+				? ' This is the compaction summary, so the conversation stops trimming its requests until you /compact again.'
+				: '';
+
+			if (!parsed.confirmed) {
+				toast.message(`Would delete ${describeSize(plan.plan.counts, plan.plan.chars)}`, {
+					description: `That is ${described}.${summaryWarning} Nothing is deleted yet: repeat as /delete ${
+						parsed.kind === 'in-place' ? parsed.position : `last ${parsed.count}`
+					} confirm. This cannot be undone — export first if unsure.`,
+					duration: 25000
+				});
+
+				return;
+			}
+
+			const toastId = 'panel-command-delete';
+
+			toast.loading('Deleting…', { duration: Number.POSITIVE_INFINITY, id: toastId });
+
+			try {
+				if (parsed.kind === 'in-place') {
+					await applyInPlaceDelete(context, plan.plan);
+				} else {
+					// The app's own flow, so currNode is re-pointed at a surviving
+					// sibling exactly as the per-message trash icon does it.
+					await chatStore.deleteMessage(target.id);
+
+					// Belt and braces: the in-tree flow reconciles the pointer too,
+					// but this also covers a tree that has the panel's compaction
+					// module without that hunk.
+					if (plan.plan.dropsCompactionSummary) await clearCompactionPoint(context.convId);
+				}
+
+				toast.success(`Deleted ${describeSize(plan.plan.counts, plan.plan.chars)}`, {
+					description: plan.plan.dropsCompactionSummary
+						? 'The compaction summary went with it — the full history is sent again until you /compact.'
+						: undefined,
+					id: toastId
+				});
+			} catch (error) {
+				toast.error(
+					`Delete failed: ${error instanceof Error ? error.message : String(error)}`,
 					{ id: toastId }
 				);
 			}

@@ -38,7 +38,7 @@ flowchart LR
     rightbar --> panelfe
     panelfe <--> panelbe
     llama <--> bridge
-    bridge --> imagegen & nim & openrouter & rag & fs
+    bridge --> imagegen & nim & openrouter & rag & files & fs
     imagegen --> sd
 ```
 
@@ -50,7 +50,7 @@ the models. The Web UI (or any client that drives tool calls) talks to
 
 | Path | What it is |
 | --- | --- |
-| `MCP/` | MCP servers — `imagegen`, `nim`, `openrouter`, `rag`, `mcp-filesystem` — plus the combined `llama-mcp-servers.json` config |
+| `MCP/` | MCP servers — `files`, `imagegen`, `nim`, `openrouter`, `rag`, `mcp-filesystem` — plus the combined `llama-mcp-servers.json` config |
 | `panel/` | Svelte frontend + FastAPI backend for the right-bar panel, plus the `right-bar.patch` it's built from |
 | `llama-models.ini` | Per-model `llama-server` launch config |
 
