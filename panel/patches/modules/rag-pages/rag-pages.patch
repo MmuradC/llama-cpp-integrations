@@ -1,0 +1,34 @@
+diff --git a/tools/ui/src/routes/rag-collections/+page.svelte b/tools/ui/src/routes/rag-collections/+page.svelte
+new file mode 100644
+index 0000000000..fa6a4b528d
+--- /dev/null
++++ b/tools/ui/src/routes/rag-collections/+page.svelte
+@@ -0,0 +1,11 @@
++<script lang="ts">
++	// RAG collections: the list of collections, with create and delete.
++	//
++	// The page itself lives outside this tree
++	// (panel/frontend/RagCollectionsPage.svelte, reached through the @mcp-panel
++	// alias) so a llama.cpp version bump cannot take it away; this file exists
++	// only so SvelteKit's router can discover the page at all.
++	import RagCollectionsPage from '@mcp-panel/RagCollectionsPage.svelte';
++</script>
++
++<RagCollectionsPage />
+diff --git a/tools/ui/src/routes/rag/+page.svelte b/tools/ui/src/routes/rag/+page.svelte
+new file mode 100644
+index 0000000000..707e639e98
+--- /dev/null
++++ b/tools/ui/src/routes/rag/+page.svelte
+@@ -0,0 +1,11 @@
++<script lang="ts">
++	// RAG collection editor: documents and their ingestion state for one collection.
++	//
++	// The page itself lives outside this tree (panel/frontend/RagPage.svelte,
++	// reached through the @mcp-panel alias) so a llama.cpp version bump cannot
++	// take it away; this file exists only so SvelteKit's router can discover the
++	// page at all.
++	import RagPage from '@mcp-panel/RagPage.svelte';
++</script>
++
++<RagPage />

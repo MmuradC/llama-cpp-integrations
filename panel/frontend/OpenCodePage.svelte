@@ -1,4 +1,6 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from './panel-origin';
+import { syncMainFavorites } from './pinned-favorites';
 	// Lives entirely outside llama.cpp's own source tree — see ../README.md.
 	// Mirrors NimPage.svelte's structure exactly (same pin/favorite/copy
 	// pattern against a third provider) — see that file, and
@@ -16,17 +18,23 @@
 	import { Input } from '$lib/components/ui/input';
 	import * as Table from '$lib/components/ui/table';
 	import ProviderUsagePanel from './ProviderUsagePanel.svelte';
+	// The key editor moved onto each provider's page (see ProviderKeySection's
+	// header): OpenCode was the first storefront to use it. The import below is
+	// load-bearing - without it the route module throws
+	// "ProviderKeySection is not defined" and the whole OpenCode page never
+	// mounts (seen as a click that changes the hash but nothing else).
+	import ProviderKeySection from './ProviderKeySection.svelte';
 	import { onMount } from 'svelte';
 
-	const MODELS_URL = 'http://127.0.0.1:9010/api/opencode/models';
-	const PINNED_URL = 'http://127.0.0.1:9010/api/opencode/pinned';
-	const CONTEXT_LIMITS_URL = 'http://127.0.0.1:9010/api/context-limits';
-	const PIN_URL = 'http://127.0.0.1:9010/api/opencode/pin';
-	const UNPIN_URL = 'http://127.0.0.1:9010/api/opencode/unpin';
+	const MODELS_URL = `${PANEL_ORIGIN}/api/opencode/models`;
+	const PINNED_URL = `${PANEL_ORIGIN}/api/opencode/pinned`;
+	const CONTEXT_LIMITS_URL = `${PANEL_ORIGIN}/api/context-limits`;
+	const PIN_URL = `${PANEL_ORIGIN}/api/opencode/pin`;
+	const UNPIN_URL = `${PANEL_ORIGIN}/api/opencode/unpin`;
 	// Live Go plan allowance: rolling 5h / weekly / monthly, straight from
 	// OpenCode's own GET /usage (proxied by the panel backend, so the key never
 	// reaches the browser). Same endpoint the right bar's OpenCode row reads.
-	const PLAN_USAGE_URL = 'http://127.0.0.1:9010/api/opencode/plan-usage';
+	const PLAN_USAGE_URL = `${PANEL_ORIGIN}/api/opencode/plan-usage`;
 
 	type OpenCodeModel = { id: string };
 
@@ -130,6 +138,9 @@
 			if (wasPinned) next.delete(model.id);
 			else next.add(model.id);
 			pinnedIds = next;
+			// A pin is a favorite: fill the main dropdown's heart for this model's
+			// registered id so it shows under "Favorite models" without a second click.
+			syncMainFavorites(registeredId(model.id), !wasPinned);
 		} catch (err) {
 			pinError = err instanceof Error ? err.message : 'Failed to update pin';
 		} finally {
@@ -211,7 +222,9 @@
 
 
 	{#if models}
-		<Table.Root>
+		<!-- long real ids: let the table scroll on a phone instead of squishing -->
+		<div class="w-full overflow-x-auto">
+			<Table.Root class="min-w-[40rem]">
 			<Table.Header>
 				<Table.Row>
 					<Table.Head class="w-8"></Table.Head>
@@ -264,7 +277,8 @@
 					</Table.Row>
 				{/each}
 			</Table.Body>
-		</Table.Root>
+			</Table.Root>
+		</div>
 
 		{#if filtered.length > 200}
 			<p class="text-center text-xs text-muted-foreground">

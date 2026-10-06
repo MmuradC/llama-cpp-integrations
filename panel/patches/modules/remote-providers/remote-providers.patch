@@ -1,0 +1,248 @@
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ChatFormContextGauge.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ChatFormContextGauge.svelte
+index d3bf0446c1..d6bad98dc9 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ChatFormContextGauge.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ChatFormContextGauge.svelte
+@@ -42,16 +42,16 @@
+ </script>
+ 
+ <div
++	role="button"
++	tabindex="0"
+ 	aria-label="Context usage"
+-	class="flex h-5 w-5 cursor-default items-center justify-center"
+ 	data-context-gauge-trigger
++	class="flex h-5 w-5 cursor-default items-center justify-center"
+ 	onclick={gaugeTriggerClick}
+ 	onkeydown={gaugeTriggerKeydown}
+ 	onpointerdown={gaugeTriggerPointerDown}
+ 	onpointerenter={gaugeTriggerEnter}
+ 	onpointerleave={gaugeTriggerLeave}
+-	role="button"
+-	tabindex="0"
+ >
+-	<ContextGaugeDial level={gauge.colorLevel} percent={gauge.contextPercent} />
++	<ContextGaugeDial percent={gauge.contextPercent} level={gauge.colorLevel} />
+ </div>
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDetailRow.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDetailRow.svelte
+index 572d4a42dd..271997b393 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDetailRow.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDetailRow.svelte
+@@ -11,7 +11,6 @@
+ <div class="grid gap-1.5">
+ 	<div class="flex items-baseline justify-between">
+ 		<span class="text-muted-foreground">{label}</span>
+-
+ 		<span class="font-mono text-muted-foreground">{value}</span>
+ 	</div>
+ 
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDetails.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDetails.svelte
+index 0de508a619..1153c70fdd 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDetails.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDetails.svelte
+@@ -57,13 +57,12 @@
+ 					{#if cumulativeRead > 0}
+ 						<ContextGaugeDetailRow
+ 							label="Prompt tokens evaluated"
++							value={`${cumulativeRead.toLocaleString()} tok`}
+ 							subtitle={cumulativeCacheTotal > 0
+ 								? `${cumulativeCacheTotal.toLocaleString()} reused from KV cache`
+ 								: undefined}
+-							value={`${cumulativeRead.toLocaleString()} tok`}
+ 						/>
+ 					{/if}
+-
+ 					{#if cumulativeOutput > 0}
+ 						<ContextGaugeDetailRow
+ 							label="Tokens generated"
+@@ -84,10 +83,10 @@
+ 					{#if currentRead > 0}
+ 						<ContextGaugeDetailRow
+ 							label="Prompt"
++							value={`${currentRead.toLocaleString()} tok`}
+ 							subtitle={currentCache > 0
+ 								? `${currentFresh.toLocaleString()} fresh + ${currentCache.toLocaleString()} cached`
+ 								: undefined}
+-							value={`${currentRead.toLocaleString()} tok`}
+ 						/>
+ 					{/if}
+ 
+@@ -101,7 +100,6 @@
+ 					<div class="pt-1 mt-0.5 border-t border-border/30">
+ 						<div class="flex justify-between">
+ 							<span class="text-muted-foreground">KV cache total</span>
+-
+ 							<span class="font-mono font-medium">{kvTotal.toLocaleString()} tok</span>
+ 						</div>
+ 					</div>
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDial.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDial.svelte
+index 32d08323d0..67d705ae45 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDial.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeDial.svelte
+@@ -18,7 +18,7 @@
+ 	const strokeWidth = $derived(size === 'md' ? 4 : 3);
+ </script>
+ 
+-<svg class={dimensions} fill="none" viewBox="0 0 32 32">
++<svg viewBox="0 0 32 32" fill="none" class={dimensions}>
+ 	<circle
+ 		cx="16"
+ 		cy="16"
+@@ -29,15 +29,15 @@
+ 	/>
+ 
+ 	<circle
+-		class="transition-colors duration-300 {strokeLevelClass}"
+ 		cx="16"
+ 		cy="16"
+ 		r={RADIUS}
++		class="transition-colors duration-300 {strokeLevelClass}"
+ 		stroke="currentColor"
++		stroke-width={strokeWidth}
++		stroke-linecap="round"
+ 		stroke-dasharray={CIRCUMFERENCE}
+ 		stroke-dashoffset={percent !== null ? CIRCUMFERENCE * (1 - percent / 100) : CIRCUMFERENCE}
+-		stroke-linecap="round"
+-		stroke-width={strokeWidth}
+ 		transform="rotate(-90 16 16)"
+ 	/>
+ </svg>
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeLoadModel.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeLoadModel.svelte
+index 4edc72773f..022e626ae9 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeLoadModel.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugeLoadModel.svelte
+@@ -14,13 +14,11 @@
+ {#if modelId !== null && !isLoading}
+ 	<div class="flex flex-col gap-2 border-t border-border/50 pt-2 text-xs text-muted-foreground">
+ 		<span>Available context size is only visible once the model is loaded.</span>
+-
+-		<Button class="self-start" onclick={onLoad} size="sm" variant="secondary">Load model</Button>
++		<Button size="sm" variant="secondary" class="self-start" onclick={onLoad}>Load model</Button>
+ 	</div>
+ {:else if isLoading}
+ 	<div class="flex items-center gap-2 border-t border-border/50 pt-2 text-xs text-muted-foreground">
+ 		<Loader2 class="h-3.5 w-3.5 animate-spin" />
+-
+ 		<span>Loading model...</span>
+ 	</div>
+ {/if}
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
+index 8fa09cf704..5d80ecc11b 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
+@@ -54,19 +54,17 @@
+ 
+ {#if gaugePopup.open}
+ 	<div
++		role="status"
+ 		bind:this={cardEl}
+ 		class="absolute z-50 w-64 -translate-x-1/2 rounded-lg border border-border/50 bg-popover p-3 text-sm text-popover-foreground shadow-lg ring-1 ring-foreground/10"
++		style="left: {gaugePopup.centerX}px; bottom: {gaugePopup.bottom}px"
+ 		onpointerenter={gaugeCardEnter}
+ 		onpointerleave={gaugeCardLeave}
+-		role="status"
+-		style="left: {gaugePopup.centerX}px; bottom: {gaugePopup.bottom}px"
+ 	>
+ 		<div class="flex flex-col gap-2">
+ 			<div class="flex items-center gap-2">
+ 				<span class="font-medium">Context</span>
+-
+ 				<span class="text-muted-foreground">·</span>
+-
+ 				<span class="font-mono text-muted-foreground">
+ 					{formatParameters(gauge.contextUsed)}
+ 					/ {gauge.contextTotal !== null ? formatParameters(gauge.contextTotal) : '-'}
+@@ -75,8 +73,8 @@
+ 
+ 			{#if gauge.activeModelId !== null && !gauge.isActiveModelLoaded}
+ 				<ContextGaugeLoadModel
+-					isLoading={gauge.isActiveModelLoading}
+ 					modelId={gauge.activeModelId}
++					isLoading={gauge.isActiveModelLoading}
+ 					onLoad={gauge.loadModel}
+ 				/>
+ 			{:else if showProgressBar}
+@@ -93,7 +91,6 @@
+ 					<span>
+ 						<span class={colorLevelTextClass(gauge.colorLevel)}>{gauge.contextPercent}%</span> used
+ 					</span>
+-
+ 					<span>
+ 						{formatParameters(gauge.contextAvailable ?? 0)} remaining
+ 					</span>
+@@ -104,15 +101,15 @@
+ 
+ 			{#if gauge.hasAnyUsage}
+ 				<ContextGaugeDetails
+-					averageTokensPerSecond={gauge.averageTokensPerSecond}
+-					cumulativeCacheTotal={gauge.cumulativeCacheTotal}
+-					cumulativeOutput={gauge.cumulativeOutput}
+-					cumulativeRead={gauge.cumulativeRead}
+-					currentCache={gauge.currentCache}
++					currentRead={gauge.currentRead}
+ 					currentFresh={gauge.currentFresh}
++					currentCache={gauge.currentCache}
+ 					currentOutput={gauge.currentOutput}
+-					currentRead={gauge.currentRead}
+ 					kvTotal={gauge.kvTotal}
++					cumulativeRead={gauge.cumulativeRead}
++					cumulativeOutput={gauge.cumulativeOutput}
++					cumulativeCacheTotal={gauge.cumulativeCacheTotal}
++					averageTokensPerSecond={gauge.averageTokensPerSecond}
+ 					transientDetails={gauge.transientDetails}
+ 				/>
+ 			{/if}
+diff --git a/tools/ui/src/routes/nim/+page.svelte b/tools/ui/src/routes/nim/+page.svelte
+new file mode 100644
+index 0000000000..bdb4f7bf1e
+--- /dev/null
++++ b/tools/ui/src/routes/nim/+page.svelte
+@@ -0,0 +1,13 @@
++<script lang="ts">
++	// NVIDIA NIM model browser: pinned models for the NIM provider.
++	//
++	// The page itself lives outside this tree (panel/frontend/NimPage.svelte,
++	// reached through the @mcp-panel alias) so a llama.cpp version bump cannot
++	// take it away; this file exists only so SvelteKit's router can discover the
++	// page at all — the same reason upstream ships the settings and mcp-servers
++	// route files. Without it, RightBar's `#/nim` link changes the hash and
++	// renders nothing.
++	import NimPage from '@mcp-panel/NimPage.svelte';
++</script>
++
++<NimPage />
+diff --git a/tools/ui/src/routes/opencode/+page.svelte b/tools/ui/src/routes/opencode/+page.svelte
+new file mode 100644
+index 0000000000..fc507ac28b
+--- /dev/null
++++ b/tools/ui/src/routes/opencode/+page.svelte
+@@ -0,0 +1,12 @@
++<script lang="ts">
++	// OpenCode model browser: pinned models for the OpenCode Go provider.
++	//
++	// The page itself lives outside this tree (panel/frontend/OpenCodePage.svelte,
++	// reached through the @mcp-panel alias) so a llama.cpp version bump cannot
++	// take it away; this file exists only so SvelteKit's router can discover the
++	// page at all. Without it, RightBar's `#/opencode` link changes the hash and
++	// renders nothing.
++	import OpenCodePage from '@mcp-panel/OpenCodePage.svelte';
++</script>
++
++<OpenCodePage />
+diff --git a/tools/ui/src/routes/openrouter/+page.svelte b/tools/ui/src/routes/openrouter/+page.svelte
+new file mode 100644
+index 0000000000..7726cb4fe9
+--- /dev/null
++++ b/tools/ui/src/routes/openrouter/+page.svelte
+@@ -0,0 +1,12 @@
++<script lang="ts">
++	// OpenRouter model browser: pinned models for the OpenRouter provider.
++	//
++	// The page itself lives outside this tree (panel/frontend/OpenRouterPage.svelte,
++	// reached through the @mcp-panel alias) so a llama.cpp version bump cannot
++	// take it away; this file exists only so SvelteKit's router can discover the
++	// page at all. Without it, RightBar's `#/openrouter` link changes the hash
++	// and renders nothing.
++	import OpenRouterPage from '@mcp-panel/OpenRouterPage.svelte';
++</script>
++
++<OpenRouterPage />

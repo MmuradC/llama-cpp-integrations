@@ -1,4 +1,5 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from './panel-origin';
 	// Lives entirely outside llama.cpp's own source tree — see ../README.md.
 	// Reached from the "RAG Collections" button in the left sidebar (see
 	// SIDEBAR_ACTIONS_ITEMS in ui.constants.ts). The route file that makes
@@ -29,7 +30,6 @@
 
 	let { iconClose: IconClose, iconDelete: IconDelete, iconExpand: IconExpand }: Props = $props();
 
-	const PANEL_ORIGIN = 'http://127.0.0.1:9010';
 	const COLLECTIONS_URL = `${PANEL_ORIGIN}/api/rag/collections`;
 
 	type RagDocument = {

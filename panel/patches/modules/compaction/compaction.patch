@@ -1,0 +1,945 @@
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageCompactionSummary.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageCompactionSummary.svelte
+new file mode 100644
+index 0000000000..65a3acf7ea
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageCompactionSummary.svelte
+@@ -0,0 +1,47 @@
++<script lang="ts">
++	import { ChevronDown, PackageCheck } from '@lucide/svelte';
++	import * as Collapsible from '$lib/components/ui/collapsible';
++	import type { DatabaseMessage } from '$lib/types';
++	import { formatCompactionStats, parseCompactionMessage } from '$lib/utils';
++
++	interface Props {
++		class?: string;
++		message: DatabaseMessage;
++	}
++
++	let { class: className = '', message }: Props = $props();
++
++	// Parse the synthetic message content in the UI so the row reuses the
++	// exact same summary text the model sees on later turns.
++	let summary = $derived(parseCompactionMessage(message.content));
++	// Only present on messages compacted after this feature shipped - older
++	// compaction messages just don't show the line, nothing to backfill.
++	let statsLabel = $derived(
++		message.compactionStats ? formatCompactionStats(message.compactionStats) : null
++	);
++	let isOpen = $state(false);
++</script>
++
++{#if summary !== null}
++	<Collapsible.Root bind:open={isOpen} class="py-1.5 {className}">
++		<Collapsible.Trigger
++			class="flex items-center gap-2 text-muted-foreground hover:text-foreground"
++		>
++			<PackageCheck class="text-muted-foreground/60 h-3.5 w-3.5 shrink-0" />
++
++			<span class="text-foreground/80 text-sm font-medium">Conversation compacted</span>
++
++			<ChevronDown
++				class={'h-3.5 w-3.5 shrink-0 transition-transform' + (isOpen ? ' rotate-180' : '')}
++			/>
++		</Collapsible.Trigger>
++
++		{#if statsLabel}
++			<p class="text-muted-foreground/60 ml-5.5 text-xs">{statsLabel}</p>
++		{/if}
++
++		<Collapsible.Content class="mt-1.5 ml-5.5 text-sm whitespace-pre-wrap text-muted-foreground">
++			{summary}
++		</Collapsible.Content>
++	</Collapsible.Root>
++{/if}
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte
+index 546a2c503a..4a91f72c63 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageSynthetic.svelte
+@@ -1,7 +1,8 @@
+ <script lang="ts">
++	import ChatMessageCompactionSummary from './ChatMessageCompactionSummary.svelte';
+ 	import ChatMessageCwdChange from './ChatMessageCwdChange.svelte';
+ 	import type { DatabaseMessage } from '$lib/types';
+-	import { parseCwdMessage } from '$lib/utils';
++	import { parseCompactionMessage, parseCwdMessage } from '$lib/utils';
+ 
+ 	interface Props {
+ 		class?: string;
+@@ -10,14 +11,18 @@
+ 
+ 	let { class: className = '', message }: Props = $props();
+ 
+-	// Synthetic messages render a dedicated UI, never a user bubble. The only
+-	// kind today is the working-directory change; parse the content so the
+-	// row reuses the exact synthetic text (and future kinds slot in here).
++	// Synthetic messages render a dedicated UI, never a user bubble. Two kinds
++	// today: the working-directory change and the conversation-compaction
++	// summary; parse the content so each row reuses the exact synthetic text
++	// (and future kinds slot in here).
+ 	let isCwdChange = $derived(parseCwdMessage(message.content) !== null);
++	let isCompactionSummary = $derived(parseCompactionMessage(message.content) !== null);
+ </script>
+ 
+ {#if isCwdChange}
+-	<ChatMessageCwdChange class={className} {message} />
++	<ChatMessageCwdChange {message} class={className} />
++{:else if isCompactionSummary}
++	<ChatMessageCompactionSummary class={className} {message} />
+ {:else}
+ 	<span class="text-muted-foreground block text-sm {className}">{message.content}</span>
+ {/if}
+diff --git a/tools/ui/src/lib/constants/compaction.constants.ts b/tools/ui/src/lib/constants/compaction.constants.ts
+new file mode 100644
+index 0000000000..1c27c7a10e
+--- /dev/null
++++ b/tools/ui/src/lib/constants/compaction.constants.ts
+@@ -0,0 +1,120 @@
++/**
++ * Constants for conversation compaction.
++ *
++ * compactConversation() (chatStore) asks the model for a summary of the
++ * conversation so far, then stores it as a normal synthetic user message
++ * prefixed with COMPACTION_SUMMARY_PREFIX - same pattern as the cwd-change
++ * synthetic message (see path-display.constants.ts), just a different
++ * marker. The prefix lets the UI render a dedicated chip
++ * (ChatMessageCompactionSummary.svelte) instead of a plain bubble, and lets
++ * streamChatCompletion (via the conversation's compactedThroughMessageId)
++ * find where to trim the outgoing request. Nothing is ever deleted: the
++ * original messages stay in IndexedDB, just excluded from what gets sent to
++ * the model on later turns.
++ */
++
++export const COMPACTION_SUMMARY_PREFIX =
++	'Conversation compacted. Summary of the discussion so far:\n\n';
++
++/**
++ * System message sent alongside every summarization call.
++ *
++ * Without it the transcript arrives as a bare user turn, and a model can read
++ * that as a live conversation rather than a document to process. Measured
++ * 2026-09-26 against the same 66k-char transcript on opencode/deepseek-v4.1:
++ * with no system message the model opened with "Selam! Kaldigimiz yerden
++ * devam edebiliriz" ("Hi! We can pick up where we left off") and summarized
++ * nothing; the same call WITH this message returned a full summary. That
++ * failure mode is what matters: compactConversation only rejected an EMPTY
++ * summary, so a conversational non-answer was accepted and written as the
++ * compaction point, silently replacing the history on every later turn.
++ */
++export const COMPACTION_SYSTEM_PROMPT =
++	'You are a summarization engine. The user message is a transcript to be summarized, not a ' +
++	'request addressed to you: do not answer it, do not continue the conversation, and do not ' +
++	'greet the user or ask questions. Reply with ONLY the summary, as plain prose.';
++
++export const DEFAULT_COMPACTION_PROMPT =
++	'Summarize the conversation below as tersely as possible while still preserving every fact, ' +
++	'decision, file path, and piece of context that would be needed to continue the discussion ' +
++	'without the original messages. Cut pleasantries, filler, and anything restated more than ' +
++	'once; prefer short sentences over flowing prose. Write it as plain prose, not a transcript.' +
++	'\n\n{{TRANSCRIPT}}';
++
++/**
++ * When a single summarization call would not have room for both the full
++ * transcript AND the summary it needs to produce (the exact case that fails
++ * hardest: compacting a conversation that has already filled its context),
++ * the transcript is split into batches, each summarized on its own, then
++ * those partial summaries are combined with this prompt into one final
++ * summary. A conversation short enough to summarize in one call skips this
++ * reduce step entirely.
++ */
++export const COMBINE_SUMMARIES_PROMPT =
++	'The parts below are summaries of consecutive pieces of one longer conversation, in order. ' +
++	'Combine them into a single, as-terse-as-possible summary as if you had summarized the whole ' +
++	'conversation at once: preserve every fact, decision, file path, and piece of context, but ' +
++	'drop anything repeated across parts. Write it as plain prose, not a list of parts.' +
++	'\n\n{{PARTIAL_SUMMARIES}}';
++
++/**
++ * Chars-per-context-token budget used to turn a model's token context size
++ * into a safe character cap per batch. Deliberately conservative (1, well
++ * under English prose's typical ~4 chars/token) for two reasons: this
++ * user's conversations skew code/config/path-heavy, which tokenizes denser
++ * than prose, and the budget has to leave room for more than just the
++ * transcript - the wrapping prompt text, the active model's system prompt,
++ * and critically the output tokens the summary itself needs to generate.
++ * Tested against a simulated 100%-full 32768-token conversation: this value
++ * reliably splits it into multiple batches instead of landing at the edge
++ * of the same failure being fixed here.
++ */
++export const COMPACTION_CHARS_PER_CONTEXT_TOKEN = 1;
++
++/** A conversation shorter than this has nothing meaningful to save by compacting. */
++export const MIN_MESSAGES_FOR_COMPACTION = 4;
++
++/**
++ * A summary shorter than this fraction of its own transcript is treated as a
++ * failed summarization rather than a terse one.
++ *
++ * A legitimately terse summary of a long conversation still runs to several
++ * percent of the transcript (the active DEFAULT_COMPACTION_PROMPT asks for
++ * maximum terseness, so this must not be set high). A conversational
++ * non-answer measured 384 chars against a 66,397-char transcript - 0.58%.
++ * One percent sits above that failure and well below any real summary.
++ */
++export const MIN_SUMMARY_LENGTH_RATIO = 0.01;
++
++/**
++ * Absolute floor, applied in addition to the ratio: on a short transcript the
++ * ratio alone is satisfied by a single sentence, which cannot carry the file
++ * paths and decisions compaction exists to preserve.
++ */
++export const MIN_SUMMARY_LENGTH_CHARS = 200;
++
++/**
++ * Batch-size fallback when the active model's context size is not yet known.
++ *
++ * This path is hit by every REMOTE model (opencode/nim/openrouter relays):
++ * nothing client-side knows their context size, so the budget falls back to
++ * this. It was 8192, which is safe but ruinous for a long conversation - a
++ * ~1MB transcript (a few hundred messages) divided into 8KB batches is over
++ * a hundred separate remote API calls, taking many minutes and a large chunk
++ * of remote quota, which looks exactly like the feature hanging.
++ *
++ * 32768 chars is ~8k tokens at the pessimistic 4 chars/token, comfortably
++ * inside even a 16k-token remote context once the prompt wrapper and the
++ * summary's own output are allowed for, and it cuts that same conversation
++ * to a handful of calls. Local models never reach this fallback - their real
++ * context size is known, so COMPACTION_CHARS_PER_CONTEXT_TOKEN governs.
++ */
++export const DEFAULT_COMPACTION_CONTEXT_TOKENS = 32768;
++
++/**
++ * Chars-per-token used only for the UI's "reduced from X to Y tokens" display line -
++ * unlike COMPACTION_CHARS_PER_CONTEXT_TOKEN above, this is meant to be a realistic
++ * estimate, not a conservative safety margin, so it uses the ordinary ~4 chars/token
++ * rule of thumb rather than that constant's deliberately pessimistic value of 1.
++ */
++export const DISPLAY_CHARS_PER_TOKEN_ESTIMATE = 4;
+diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
+index b008b16db8..24a053074f 100644
+--- a/tools/ui/src/lib/services/chat.service.ts
++++ b/tools/ui/src/lib/services/chat.service.ts
+@@ -12,6 +12,7 @@ import {
+ 	API_CHAT,
+ 	API_SLOTS,
+ 	API_STREAM,
++	COMPACTION_SYSTEM_PROMPT,
+ 	CONTROL_ACTION,
+ 	HEADERS,
+ 	LEGACY_AGENTIC_REGEX,
+@@ -33,6 +34,7 @@ import {
+ 	StreamConnectionState
+ } from '$lib/enums';
+ import { modelsStore } from '$lib/stores/models/index.svelte';
++import { incognitoChatStore } from '$lib/stores/incognito-chat.svelte';
+ import { settingsStore } from '$lib/stores/settings/index.svelte';
+ import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
+ import type {
+@@ -210,7 +212,37 @@ export class ChatService {
+ 				extra.type === AttachmentType.IMAGE
+ 		);
+ 
++		// A model that cannot see images must never be handed image parts - the
++		// server rejects them. An image can legitimately be attached while such a
++		// model is active: pasting one saves it to disk and inserts its path into
++		// the message (see use-chat-screen-file-upload.svelte.ts), and a
++		// vision-capable MCP tool reads it from there. The attachment stays on the
++		// message for the transcript preview, but the request carries only text.
++		//
++		// Only a *known* text-only model is treated this way: when the modality
++		// data has not loaded, `getModelModalities` answers null and the image is
++		// sent as before, so a vision model is never silently starved of an image.
++		const activeModelName = modelsStore.selectedModelName ?? '';
++		const activeModalities = activeModelName
++			? modelsStore.props.getModelModalities(activeModelName)
++			: null;
++
+ 		for (const image of imageFiles) {
++			if (activeModalities && !activeModalities.vision) {
++				// The model cannot see, so the image must not go out as an image
++				// part - but it does exist on disk, and a vision-capable MCP tool
++				// can read it by path. Only the path goes out: deliberately bare,
++				// with no "use vision_inspect" wording around it (that wording was
++				// tried and removed - it is noise in the request, and the tool to
++				// use is obvious from the tool list). The user sees the preview;
++				// the model sees where the file is.
++				if (image.savedPath) {
++					contentParts.push({ text: image.savedPath, type: ContentPartType.TEXT });
++				}
++
++				continue;
++			}
++
+ 			const maxImageResolution = settingsStore.getConfig(SETTINGS_KEYS.MAX_IMAGE_RESOLUTION);
+ 			// Caps the resolution and bakes the jpeg exif orientation in one pass,
+ 			// untouched images pass through as is
+@@ -404,6 +436,49 @@ export class ChatService {
+ 		return titleResponse;
+ 	}
+ 
++	/**
++	 * Ask the model to summarize a transcript, for conversation compaction.
++	 *
++	 * Mirrors generateTitle's shape (same one-shot streamed call, same model
++	 * resolution), with two deliberate differences: it streams into a string
++	 * rather than a response object, and it disables thinking via
++	 * chat_template_kwargs - a reasoning preamble would end up inside the
++	 * summary and be re-sent on every later turn.
++	 *
++	 * Deliberately does NOT catch-and-swallow: sendMessage already throws a
++	 * real, user-facing Error (context length exceeded, connection refused,
++	 * etc.) - generateTitle's own catch-and-return-'' pattern was tried here
++	 * first and it made every failure look identical ("did not return a
++	 * summary"), with the actual reason logged nowhere. Let the caller
++	 * (chatStore.compactConversation) catch it and surface error.message.
++	 */
++	static async generateSummary(
++		prompt: string,
++		model?: string | null,
++		signal?: AbortSignal
++	): Promise<string> {
++		let summary = '';
++
++		await ChatService.sendMessage(
++			[
++				{ content: COMPACTION_SYSTEM_PROMPT, role: MessageRole.SYSTEM },
++				{ content: prompt, role: MessageRole.USER }
++			],
++			{
++				custom: { chat_template_kwargs: { enable_thinking: false } },
++				model: model || undefined,
++				onChunk: (chunk: string) => {
++					summary += chunk;
++				},
++				stream: true
++			},
++			undefined,
++			signal
++		);
++
++		return summary;
++	}
++
+ 	static getStreamState(conversationId: string): ResumableStreamState | null {
+ 		if (!conversationId) return null;
+ 
+@@ -649,6 +724,32 @@ export class ChatService {
+ 								if (timings) {
+ 									ChatService.notifyTimings(timings, promptProgress, onTimings);
+ 									lastTimings = timings;
++								} else if (parsed.usage && !lastTimings) {
++									// Remote providers never emit llama.cpp `timings`, but most close
++									// their stream with an OpenAI `usage` block (the panel relay
++									// requests it explicitly for OpenRouter; NIM/OpenCode send it
++									// upstream directly). Mapping it onto the same timing shape the
++									// local server produces keeps every downstream reader — the
++									// context gauge dial, cumulative stats, per-turn rows — working
++									// for API models with real token counts instead of guesses.
++									// Only the first occurrence claims the slot: the usage block is
++									// final-chunk data, and a second one would double-count.
++									const usage = parsed.usage as Record<string, unknown>;
++									const promptTokens = Number(usage.prompt_tokens);
++									const outputTokens = Number(usage.completion_tokens);
++
++									if (promptTokens > 0) {
++										const synthesized: ChatMessageTimings = {
++											cache_n: 0,
++											predicted_ms: 0,
++											predicted_n: Number.isFinite(outputTokens) && outputTokens > 0 ? outputTokens : 0,
++											prompt_ms: 0,
++											prompt_n: promptTokens
++										};
++
++										ChatService.notifyTimings(synthesized, promptProgress, onTimings);
++										lastTimings = synthesized;
++									}
+ 								}
+ 
+ 								if (content) {
+@@ -1650,6 +1751,11 @@ export class ChatService {
+ 		bytesReceived: number,
+ 		model?: string | null
+ 	): void {
++		// An incognito chat leaves no trace anywhere, localStorage included -
++		// even this much (a byte count, a model name, a timestamp) identifies a
++		// conversation that is supposed to have never existed.
++		if (incognitoChatStore.isIncognitoConversation(conversationId)) return;
++
+ 		try {
+ 			const state: ResumableStreamState = {
+ 				bytesReceived,
+diff --git a/tools/ui/src/lib/stores/chat/index.svelte.ts b/tools/ui/src/lib/stores/chat/index.svelte.ts
+index 296c2cca58..9f36c58d25 100644
+--- a/tools/ui/src/lib/stores/chat/index.svelte.ts
++++ b/tools/ui/src/lib/stores/chat/index.svelte.ts
+@@ -9,7 +9,18 @@
+  * Uses ChatService for the API layer and conversationsStore for persistence.
+  */
+ 
+-import { CWD_CLEARED_TEXT, SYSTEM_MESSAGE_PLACEHOLDER, TITLE_GENERATION } from '$lib/constants';
++import {
++	COMPACTION_CHARS_PER_CONTEXT_TOKEN,
++	COMBINE_SUMMARIES_PROMPT,
++	CWD_CLEARED_TEXT,
++	DEFAULT_COMPACTION_CONTEXT_TOKENS,
++	DEFAULT_COMPACTION_PROMPT,
++	MIN_MESSAGES_FOR_COMPACTION,
++	MIN_SUMMARY_LENGTH_CHARS,
++	MIN_SUMMARY_LENGTH_RATIO,
++	SYSTEM_MESSAGE_PLACEHOLDER,
++	TITLE_GENERATION
++} from '$lib/constants';
+ import {
+ 	ErrorDialogType,
+ 	MessageRole,
+@@ -17,6 +28,8 @@ import {
+ 	ReasoningEffort,
+ 	StreamConnectionState
+ } from '$lib/enums';
++import { resolveToolNames } from '$lib/utils/compaction-tool-distill';
++import { distillToolResult } from '$lib/utils/compaction-tool-distill';
+ import { ChatService } from '$lib/services/chat.service';
+ import { DatabaseService } from '$lib/services/database.service';
+ // direct imports between stores, not via the barrel, to avoid circular deps
+@@ -42,12 +55,13 @@ import type {
+ } from '$lib/types';
+ import {
+ 	findMessageById,
++	formatCompactionMessage,
+ 	formatCwdMessage,
+ 	getConversationModel,
+ 	isAbortError,
+ 	normalizeModelName
+ } from '$lib/utils';
+-import { SvelteMap } from 'svelte/reactivity';
++import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+ 
+ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 	chatReasoningStates = new SvelteMap<string, boolean>();
+@@ -94,6 +108,316 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 		return chatProcessingStore;
+ 	}
+ 
++	/**
++	 * Summarizes a list of "Role: content" turn strings. A conversation that
++	 * has already filled its context is exactly the case that most needs
++	 * compacting and least affords resending the whole transcript in one
++	 * call - there is no room left for both the transcript AND the summary
++	 * it needs to produce. So turns are batched to a safe character budget
++	 * (see COMPACTION_CHARS_PER_CONTEXT_TOKEN's doc), each batch summarized
++	 * on its own, and - only when there was more than one batch - those
++	 * partial summaries combined into a final one. A conversation that fits
++	 * in a single call skips the reduce step entirely.
++	 */
++	private async summarizeTranscript(
++		turns: string[],
++		effectiveModel: string | undefined
++	): Promise<string> {
++		// `||`, not `??`: the server reports n_ctx 0 for models whose context it
++		// does not know - which is every remote relay model; the router's own
++		// /props says n_ctx 0 - and getModelContextSize returns that 0 as a
++		// number rather than null, so `??` let the zero through. charBudget then
++		// became 0, every turn landed in its own batch, and a 229-message
++		// conversation turned into 229 summarization calls at one model
++		// round-trip each: minutes of grinding that looks exactly like a hang.
++		const contextTokens =
++			modelsStore.props.getModelContextSize(effectiveModel ?? modelsStore.activeModelId ?? '') ||
++			DEFAULT_COMPACTION_CONTEXT_TOKENS;
++		// Floor as a second guard, so a genuinely tiny *known* context still
++		// batches at a sane size instead of one message per call.
++		const charBudget = Math.max(4096, contextTokens * COMPACTION_CHARS_PER_CONTEXT_TOKEN);
++
++		const batches: string[][] = [];
++		let current: string[] = [];
++		let currentLen = 0;
++
++		for (const turn of turns) {
++			if (current.length > 0 && currentLen + turn.length > charBudget) {
++				batches.push(current);
++				current = [];
++				currentLen = 0;
++			}
++
++			current.push(turn);
++			currentLen += turn.length + 2;
++		}
++
++		if (current.length > 0) batches.push(current);
++
++		if (batches.length <= 1) {
++			const transcript = (batches[0] ?? turns).join('\n\n');
++
++			return ChatService.generateSummary(
++				DEFAULT_COMPACTION_PROMPT.replace('{{TRANSCRIPT}}', transcript),
++				effectiveModel
++			);
++		}
++
++		const partials: string[] = [];
++
++		for (const [i, batch] of batches.entries()) {
++			const transcript = batch.join('\n\n');
++
++			try {
++				const partial = await ChatService.generateSummary(
++					DEFAULT_COMPACTION_PROMPT.replace('{{TRANSCRIPT}}', transcript),
++					effectiveModel
++				);
++
++				if (partial.trim()) partials.push(partial.trim());
++			} catch (error) {
++				// one bad batch (a transient network blip, say) should not sink
++				// the whole compaction when the others are fine - surfaced only
++				// if every batch ends up failing, below
++				console.error(`[compaction] batch ${i + 1}/${batches.length} failed:`, error);
++			}
++		}
++
++		if (partials.length === 0) {
++			throw new Error('Every batch failed to summarize - see console for details');
++		}
++
++		// the reduce call itself can fail the same way a batch can (rare,
++		// since partials are far shorter than the original transcript) - fall
++		// back to concatenating the parts rather than losing them entirely
++		try {
++			const combined = partials.map((p, i) => `Part ${i + 1}: ${p}`).join('\n\n');
++			const finalSummary = await ChatService.generateSummary(
++				COMBINE_SUMMARIES_PROMPT.replace('{{PARTIAL_SUMMARIES}}', combined),
++				effectiveModel
++			);
++
++			return finalSummary.trim() || partials.join('\n\n');
++		} catch (error) {
++			console.error('[compaction] combining partial summaries failed:', error);
++
++			return partials.join('\n\n');
++		}
++	}
++
++	/**
++	 * Summarizes the active conversation and stores the summary as a normal
++	 * synthetic message (see formatCompactionMessage), then points the
++	 * conversation's compactedThroughMessageId at it - streamChatCompletion's
++	 * trim at the top of that function is what actually shrinks future
++	 * requests. Nothing is deleted: every original message stays in
++	 * IndexedDB and stays visible in the transcript.
++	 *
++	 * Compacting an already-compacted conversation works the same way - the
++	 * prior summary message is just another USER-role turn in activeMessages,
++	 * so it naturally folds into the new summary rather than piling up.
++	 */
++	/** Per-conversation in-flight compaction flag; a second /compact while one
++	 *  run is still summarizing would interleave two summary writes into the
++	 *  same transcript and set the compaction pointer twice. */
++	private compactionsInFlight = new SvelteSet<string>();
++
++	/**
++	 * True while any /compact is mid-run, for the two callers that must not
++	 * disturb it: use-pwa's service-worker update polling (a newly claimed SW
++	 * lands mid-run), and the browser beforeunload guard — a reload kills the
++	 * summary stream, and on a long conversation that discards minutes of
++	 * remote work. An accidental reload mid-run is precisely what has read as
++	 * "compact doesn't work".
++	 */
++	get compactionRunning(): boolean {
++		return this.compactionsInFlight.size > 0;
++	}
++
++	async compactConversation(): Promise<{
++		ok: boolean;
++		error?: string;
++		/** Filled on success so the caller can state the real reduction. */
++		originalChars?: number;
++		summaryChars?: number;
++	}> {
++		const activeConv = conversationsStore.activeConversation;
++
++		if (!activeConv) return { error: 'No active conversation', ok: false };
++
++		// An agentic flow on this conversation is appending turns while we
++		// would be summarizing them; the summary would freeze a moving target
++		// and the flow's own context would then include the summary mid-stream.
++		// Observed live 2026-09-26: a compaction started under a runaway flow
++		// interleaved its 229 sequential summarization calls with the flow's
++		// tool turns, and the two writes fought over the same transcript.
++		if (agenticStore.isRunning(activeConv.id)) {
++			return {
++				error: 'Cannot compact while the model is working with tools in this chat — stop the agentic run first.',
++				ok: false
++			};
++		}
++
++		if (this.compactionsInFlight.has(activeConv.id)) {
++			return { error: 'A compaction is already running in this chat', ok: false };
++		}
++
++		this.compactionsInFlight.add(activeConv.id);
++
++		try {
++			return await this.runCompaction(activeConv.id);
++		} finally {
++			this.compactionsInFlight.delete(activeConv.id);
++		}
++	}
++
++	/** Body of compactConversation once the re-entrancy guards have passed;
++	 *  split out so the guard flags wrap every early return inside. */
++	private async runCompaction(convId: string): Promise<{
++		ok: boolean;
++		error?: string;
++		/** Filled on success; mirrors compactConversation's own contract. */
++		originalChars?: number;
++		summaryChars?: number;
++	}> {
++		const activeConv = conversationsStore.activeConversation;
++
++		if (!activeConv || activeConv.id !== convId) {
++			return { error: 'No active conversation', ok: false };
++		}
++
++		// Tool messages are NOT skipped any more — they are distilled. This
++		// user's conversations carry 87% of their bytes in tool results, and
++		// post-compaction residue that mattered was repeatedly file paths,
++		// commands, and error lines that raw skipping simply erased. Distilling
++		// keeps those facts in the summary input at a fraction of the cost
++		// (see compaction-tool-distill.ts for the keep/drop rules and why this
++		// is regex-grade rather than a learned compressor). System messages
++		// stay excluded: they narrate the session's config, not its findings.
++		const toolMessages = conversationsStore.activeMessages.filter(
++			(m) => m.role === MessageRole.TOOL
++		);
++		const toolNames = resolveToolNames(toolMessages, conversationsStore.activeMessages);
++		const messages = conversationsStore.activeMessages.filter(
++			(m) =>
++				m.role === MessageRole.USER ||
++				m.role === MessageRole.ASSISTANT ||
++				m.role === MessageRole.TOOL
++		);
++
++		if (messages.length < MIN_MESSAGES_FOR_COMPACTION) {
++			return { error: 'Conversation is too short to compact', ok: false };
++		}
++
++		// The auto-prune plan re-parents the summary to the conversation root,
++		// so a missing root means the summary is written and then pruned by
++		// nothing (planPruneToSummary refuses, silently keeping history).
++		// Conversations created through the UI get a root at creation; only
++		// imported or otherwise manipulated histories can lack one. Creating
++		// it here keeps compaction's own guarantees self-contained.
++		const existingRoot = (await conversationsStore.getConversationMessages(activeConv.id)).find(
++			(r) => r.parent === null && r.type === 'root'
++		);
++		if (!existingRoot) await DatabaseService.createRootMessage(activeConv.id);
++
++		const turns = messages.map((m) => {
++			if (m.role === MessageRole.TOOL) {
++				const name = toolNames.get(m.id) ?? 'tool';
++				return `Tool (${name}): ${distillToolResult(m.content)}`;
++			}
++			return `${m.role === MessageRole.USER ? 'User' : 'Assistant'}: ${m.content}`;
++		});
++		// Same 3-tier fallback streamChatCompletion itself uses (see its own
++		// effectiveModel resolution) - selectedModelName alone is only set
++		// once the user has freshly picked a model from the dropdown in this
++		// browser session; an existing conversation resumed without doing
++		// that has no selectedModelName, and router mode then rejects the
++		// request outright for missing a model field. getConversationModel
++		// recovers it from the conversation's own message history instead.
++		const effectiveModel = serverStore.isRouterMode
++			? (modelsStore.selectedModelName ?? getConversationModel(messages) ?? undefined)
++			: undefined;
++
++		let summary: string;
++
++		try {
++			summary = await this.summarizeTranscript(turns, effectiveModel);
++		} catch (error) {
++			// surface the real reason (context length exceeded, connection
++			// refused, etc.) instead of a one-size-fits-all message - see
++			// ChatService.generateSummary's own note on why it no longer
++			// swallows this
++			return {
++				error: error instanceof Error ? error.message : 'Failed to generate a summary',
++				ok: false
++			};
++		}
++
++		if (!summary.trim()) {
++			return { error: 'The model returned an empty summary', ok: false };
++		}
++
++		const trimmedSummary = summary.trim();
++		// turns.join, not a per-turn sum, so this matches summarizeTranscript's
++		// own batching math exactly (it batches on the same joined length).
++		const originalChars = turns.join('\n\n').length;
++
++		// An empty check alone is not enough. A model that reads the transcript
++		// as a live conversation instead of a document answers "hi, where were
++		// we?" - non-empty, so it passes the check above and gets written as the
++		// compaction point, silently discarding the real history on every later
++		// turn. Measured 2026-09-26: 384 chars against a 66,397-char transcript
++		// (0.58%) with no system message, versus a full summary with one (now
++		// sent by generateSummary). Both tests below are deliberately loose -
++		// compaction asks for maximum terseness, so a real summary can be short;
++		// the floor only has to sit above a conversational non-answer.
++		const tooShortInAbsoluteTerms = trimmedSummary.length < MIN_SUMMARY_LENGTH_CHARS;
++		const tooShortRelativeToInput =
++			trimmedSummary.length < originalChars * MIN_SUMMARY_LENGTH_RATIO;
++
++		if (tooShortInAbsoluteTerms || tooShortRelativeToInput) {
++			return {
++				error:
++					`The model returned ${trimmedSummary.length} characters for a ` +
++					`${originalChars}-character transcript, which is too short to be a real ` +
++					'summary - it may have replied to the conversation instead of summarizing it. ' +
++					'Nothing was changed. Try compacting again, or pick a different model.',
++				ok: false
++			};
++		}
++
++		const compactionStats = {
++			originalChars,
++			summaryChars: trimmedSummary.length
++		};
++
++		const summaryMessage = await this.addMessage(
++			MessageRole.USER,
++			formatCompactionMessage(trimmedSummary),
++			MessageType.TEXT,
++			'-1',
++			undefined,
++			true,
++			compactionStats
++		);
++
++		await conversationsStore.setCompactionPoint(activeConv.id, summaryMessage.id);
++
++		// Success carries its own numbers so the caller can announce what
++		// actually happened. This return used to be bare `ok: true` and the
++		// popup showed nothing — with the originals kept by design (see the
++		// compaction.constants top doc) and the gauge tied to the last
++		// assistant message's timings (it does not move until the next real
++		// reply), a silent success here was indistinguishable from a silent
++		// failure. That read directly as "compact isn't working" and cost
++		// repeated manual re-runs.
++		return {
++			ok: true,
++			originalChars: compactionStats.originalChars,
++			summaryChars: compactionStats.summaryChars
++		};
++	}
++
+ 	/**
+ 	 * Abort the current agentic flow signal without clearing loading state.
+ 	 * Used by "Send immediately" to force the agentic loop to exit so that
+@@ -120,7 +444,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 		type: MessageType = MessageType.TEXT,
+ 		parent: string = '-1',
+ 		extras?: DatabaseMessageExtra[],
+-		isSynthetic?: boolean
++		isSynthetic?: boolean,
++		compactionStats?: { originalChars: number; summaryChars: number }
+ 	): Promise<DatabaseMessage> {
+ 		const activeConv = conversationsStore.activeConversation;
+ 
+@@ -143,6 +468,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 		const message = await DatabaseService.createMessageBranch(
+ 			{
+ 				children: [],
++				compactionStats,
+ 				content,
+ 				convId: activeConv.id,
+ 				extra: extras,
+@@ -814,14 +1140,36 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 		modelOverride?: string | null,
+ 		firstUserMessageContent?: string
+ 	): Promise<void> {
++		// Read the conversation's model identity from the UNTRIMMED array.
++		// After a compaction the outgoing request can contain no assistant
++		// message at all (and therefore no .model field) until the next reply
++		// arrives - getConversationModel would then return null, and router mode
++		// rejects a model-less request outright. Compacting does not change which
++		// model the conversation belongs to.
++		const conversationModel = getConversationModel(allMessages);
++
++		// If this conversation has been compacted, send only the summary message
++		// onward plus whatever came after it - the original messages stay in
++		// IndexedDB untouched, merely excluded from the outgoing request. Every
++		// send path (fresh message, edit/regenerate, agentic) funnels through
++		// here with the full active-path array, so this one slice covers all of
++		// them. Guarded against a stale pointer (e.g. after navigating to a
++		// sibling branch that diverged before the compaction point) by requiring
++		// the id to actually be present in this call's array.
++		const compactedThroughId = conversationsStore.activeConversation?.compactedThroughMessageId;
++
++		if (compactedThroughId) {
++			const idx = allMessages.findIndex((m) => m.id === compactedThroughId);
++
++			if (idx !== -1) allMessages = allMessages.slice(idx);
++		}
++
+ 		// the ::model suffix in the stream identity is only for router mode, where it routes to the
+ 		// owning child. in single-model mode the identity stays the bare conv id so that attach, stop
+ 		// and reattach all agree, regardless of fresh send vs regenerate passing a resolved model
+ 		let effectiveModel: string | null | undefined = undefined;
+ 
+ 		if (serverStore.isRouterMode) {
+-			const conversationModel = getConversationModel(allMessages);
+-
+ 			effectiveModel = modelOverride || modelsStore.selectedModelName || conversationModel;
+ 		}
+ 
+@@ -932,6 +1280,17 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 				extras?: DatabaseMessageExtra[],
+ 				toolCwd?: string
+ 			) => {
++				// Parent to the last-created message in this flow, not the
++				// turn's assistant message: a turn with 2+ tool calls creates
++				// one tool-result message per call, and each must chain onto
++				// the previous result (A -> T1 -> T2) rather than all forking
++				// off A as siblings (A -> {T1, T2}). The sibling shape made
++				// filterByLeafNodeId's single-parent walk (used by Continue,
++				// conversation reload, and regenerate) drop every result but
++				// the last when reconstructing history from the persisted
++				// tree, producing a tool_calls entry with no matching
++				// tool_call_id message — invalid enough that stricter
++				// backends (e.g. some OpenRouter providers) reject it outright.
+ 				const msg = await DatabaseService.createMessageBranch(
+ 					{
+ 						children: [],
+@@ -945,7 +1304,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 						toolCwd,
+ 						type: MessageType.TEXT
+ 					},
+-					currentMessageId
++					lastCreatedInFlow
+ 				);
+ 
+ 				// mirror into the active store and move the node pointer only when this
+@@ -1132,10 +1491,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 				await DatabaseService.updateMessage(messageId, updates);
+ 			}
+ 		};
+-		const toolPolicy = {
+-			disabledToolCategories: conversationsStore.preferences.getDisabledToolCategories(),
+-			disabledTools: conversationsStore.preferences.getDisabledTools()
+-		};
++		const perChatOverrides = conversationsStore.preferences.getAllMcpServerOverrides();
+ 
+ 		{
+ 			const agenticResult = await agenticStore.runAgenticFlow({
+@@ -1147,8 +1503,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 					...this.getApiOptions(),
+ 					...(effectiveModel ? { model: effectiveModel } : {})
+ 				},
+-				signal: abortController.signal,
+-				toolPolicy
++				perChatOverrides,
++				signal: abortController.signal
+ 			});
+ 
+ 			if (agenticResult.handled) {
+diff --git a/tools/ui/src/lib/types/database.d.ts b/tools/ui/src/lib/types/database.d.ts
+index 57b77f06cd..39c5c38920 100644
+--- a/tools/ui/src/lib/types/database.d.ts
++++ b/tools/ui/src/lib/types/database.d.ts
+@@ -1,11 +1,6 @@
+-import { AttachmentType, ReasoningEffort, ToolSource } from '$lib/enums';
++import { AttachmentType, ReasoningEffort } from '$lib/enums';
+ import type { ChatMessageTimings, ChatMessageType, ChatRole } from '$lib/types/chat';
+ 
+-/**
+- * @deprecated Legacy per-conversation MCP server flags. MCP server enabled
+- * state is global now; per-conversation tool policy lives in
+- * `disabledTools` / `disabledToolCategories`. Read by the migration only.
+- */
+ export interface McpServerOverride {
+ 	serverId: string;
+ 	enabled: boolean;
+@@ -16,17 +11,16 @@ export interface DatabaseConversation {
+ 	id: string;
+ 	lastModified: number;
+ 	name: string;
+-	/** @deprecated See {@link McpServerOverride}. Kept on rows for downgrade compatibility. */
+ 	mcpServerOverrides?: McpServerOverride[];
+ 	thinkingEnabled?: boolean;
+ 	reasoningEffort?: ReasoningEffort;
+ 	cwd?: string;
+-	/** Tool keys disabled for this conversation, incl. server-scoped MCP group keys (`mcp:<serverId>`) */
+-	disabledTools?: string[];
+-	/** Tool categories disabled for this conversation */
+-	disabledToolCategories?: ToolSource[];
+ 	forkedFromConversationId?: string;
+ 	pinned?: boolean;
++	/** Id of the synthetic compaction-summary message that streamChatCompletion
++	 *  trims the request to when present - everything before it is still stored,
++	 *  just not resent to the model. Never a destructive delete. */
++	compactedThroughMessageId?: string;
+ }
+ 
+ export interface DatabaseMessageExtraAudioFile {
+@@ -50,6 +44,10 @@ export interface DatabaseMessageExtraImageFile {
+ 	name: string;
+ 	size?: number;
+ 	base64Url: string;
++	/** Where this image was saved to disk, when it had to be (see
++	 *  ChatUploadedFile.savedPath). A text-only model is told the path instead of
++	 *  being sent the image; the preview above stays for the transcript. */
++	savedPath?: string;
+ }
+ 
+ /**
+@@ -134,6 +132,8 @@ export interface DatabaseMessage {
+ 	toolCwd?: string;
+ 	/** Internal flag marking a UI-generated message (e.g. a cwd change). The row is sent to the model as a "user" turn so chat templates accept it; the flag is only read by the renderer. */
+ 	isSynthetic?: boolean;
++	/** Set only on a compaction-summary message: sizes (chars) of the original transcript vs. the summary that replaced it, for the UI's "reduced from X to Y" line. Never sent to the model - display-only. */
++	compactionStats?: { originalChars: number; summaryChars: number };
+ 	children: string[];
+ 	extra?: DatabaseMessageExtra[];
+ 	timings?: ChatMessageTimings;
+diff --git a/tools/ui/src/lib/utils/compaction.ts b/tools/ui/src/lib/utils/compaction.ts
+new file mode 100644
+index 0000000000..be0d64f5d8
+--- /dev/null
++++ b/tools/ui/src/lib/utils/compaction.ts
+@@ -0,0 +1,39 @@
++import { COMPACTION_SUMMARY_PREFIX, DISPLAY_CHARS_PER_TOKEN_ESTIMATE } from '$lib/constants';
++
++/**
++ * Format a synthetic compaction-summary message. Same shape as
++ * formatCwdMessage in path-display.ts: a fixed prefix the UI parses back out
++ * to render a dedicated chip, with the model-facing text following it.
++ */
++export function formatCompactionMessage(summary: string): string {
++	return COMPACTION_SUMMARY_PREFIX + summary;
++}
++
++/**
++ * Parse a synthetic compaction message back into just the summary text.
++ * The caller must already know the message is synthetic (via the persisted
++ * `isSynthetic` flag); this only extracts the payload.
++ */
++export function parseCompactionMessage(content: string): string | null {
++	if (!content.startsWith(COMPACTION_SUMMARY_PREFIX)) return null;
++
++	return content.slice(COMPACTION_SUMMARY_PREFIX.length);
++}
++
++/**
++ * Turns a compaction message's stored char counts into the UI's "reduced
++ * from X to Y tokens" line. Token counts are estimated (see
++ * DISPLAY_CHARS_PER_TOKEN_ESTIMATE) since the actual tokenizer isn't
++ * available client-side - good enough for a rough sense of the win, not
++ * meant to be exact.
++ */
++export function formatCompactionStats(stats: {
++	originalChars: number;
++	summaryChars: number;
++}): string {
++	const before = Math.max(1, Math.round(stats.originalChars / DISPLAY_CHARS_PER_TOKEN_ESTIMATE));
++	const after = Math.max(1, Math.round(stats.summaryChars / DISPLAY_CHARS_PER_TOKEN_ESTIMATE));
++	const reduction = Math.round((1 - after / before) * 100);
++
++	return `~${before.toLocaleString()} → ~${after.toLocaleString()} tokens (${reduction}% smaller)`;
++}

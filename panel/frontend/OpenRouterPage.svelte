@@ -1,4 +1,6 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from './panel-origin';
+import { syncMainFavorites } from './pinned-favorites';
 	// Lives entirely outside llama.cpp's own source tree — see ../README.md.
 	// Reached from the "Browse OpenRouter models" link in RightBar.svelte.
 	// The route file that makes this discoverable to SvelteKit's router is
@@ -14,10 +16,10 @@
 	import ProviderUsagePanel from './ProviderUsagePanel.svelte';
 	import { onMount } from 'svelte';
 
-	const MODELS_URL = 'http://127.0.0.1:9010/api/openrouter/models';
-	const PINNED_URL = 'http://127.0.0.1:9010/api/openrouter/pinned';
-	const PIN_URL = 'http://127.0.0.1:9010/api/openrouter/pin';
-	const UNPIN_URL = 'http://127.0.0.1:9010/api/openrouter/unpin';
+	const MODELS_URL = `${PANEL_ORIGIN}/api/openrouter/models`;
+	const PINNED_URL = `${PANEL_ORIGIN}/api/openrouter/pinned`;
+	const PIN_URL = `${PANEL_ORIGIN}/api/openrouter/pin`;
+	const UNPIN_URL = `${PANEL_ORIGIN}/api/openrouter/unpin`;
 
 	type OpenRouterModel = {
 		id: string;
@@ -110,6 +112,8 @@
 			if (wasPinned) next.delete(model.id);
 			else next.add(model.id);
 			pinnedIds = next;
+			// A pin is a favorite — fill the main dropdown's heart (see pinned-favorites).
+			syncMainFavorites(`${'openrouter'}/${model.id.replace(/\//g, '__')}`, !wasPinned);
 		} catch (err) {
 			pinError = err instanceof Error ? err.message : 'Failed to update pin';
 		} finally {
@@ -168,7 +172,7 @@
 	     OpenCode page via ProviderUsagePanel, which also documents why
 	     each provider gets a different shape (this one has an account-wide credit figure from its own API). -->
 	<ProviderUsagePanel title="OpenRouter credits"
-		url="http://127.0.0.1:9010/api/usage-summary"
+		url={`${PANEL_ORIGIN}/api/usage-summary`}
 		provider="openrouter" />
 
 	<div>
@@ -232,7 +236,9 @@
 	</div>
 
 	{#if models}
-		<Table.Root>
+		<!-- long real ids: let the table scroll on a phone instead of squishing -->
+		<div class="w-full overflow-x-auto">
+			<Table.Root>
 			<Table.Header>
 				<Table.Row>
 					<Table.Head class="w-8"></Table.Head>
@@ -298,7 +304,8 @@
 					</Table.Row>
 				{/each}
 			</Table.Body>
-		</Table.Root>
+			</Table.Root>
+		</div>
 
 		{#if filtered.length > 200}
 			<p class="text-center text-xs text-muted-foreground">

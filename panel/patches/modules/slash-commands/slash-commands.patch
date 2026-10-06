@@ -1,5 +1,5 @@
 diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte
-index dec9e5b1c7..57b3597ff5 100644
+index dec9e5b1c7..8721395b4d 100644
 --- a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte
 +++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormPickers/ChatFormPickerCommand.svelte
 @@ -1,5 +1,5 @@
@@ -20,15 +20,51 @@ index dec9e5b1c7..57b3597ff5 100644
  		[ChatFormCommandAction.PROMPT]: Sparkles
  	};
  
-@@ -119,7 +123,7 @@
+@@ -104,36 +108,34 @@
+ <ChatFormPickerPopover
+ 	bind:isOpen
+ 	class={className}
++	srLabel="Open command picker"
+ 	{onClose}
+ 	onKeydown={handleKeydown}
+-	srLabel="Open command picker"
+ >
+ 	<ChatFormPickerList
+-		emptyMessage="No matching command"
+-		isLoading={false}
+-		itemKey={(command) => command.name}
+ 		items={filteredCommands}
+-		scrollTrigger={nav.scrollTrigger}
+-		searchQuery={query ?? ''}
++		isLoading={false}
+ 		selectedIndex={nav.hoveredIndex}
  		showSearchInput={false}
++		searchQuery={query ?? ''}
++		emptyMessage="No matching command"
++		itemKey={(command) => command.name}
++		scrollTrigger={nav.scrollTrigger}
  	>
  		{#snippet item(command, index, isSelected)}
 -			{@const Icon = commandIcon[command.action]}
 +			{@const Icon = command.icon ?? commandIcon[command.action]}
  			<ChatFormPickerListItem
  				dataIndex={index}
- 				disabled={command.disabled}
+-				disabled={command.disabled}
+ 				{isSelected}
++				disabled={command.disabled}
+ 				onclick={() => handleSelect(command)}
+ 				onmouseenter={() => {
+ 					if (!command.disabled) nav.setHover(index);
+ 				}}
+ 			>
+ 				<Icon class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+-
+ 				<div class="flex min-w-0 flex-1 flex-col">
+ 					<span class="font-mono text-sm font-medium">/{command.name}</span>
+-
+ 					<span class="min-w-0 flex-1 truncate text-left text-xs text-muted-foreground">
+ 						{command.description}
+ 					</span>
 diff --git a/tools/ui/src/lib/enums/chat.enums.ts b/tools/ui/src/lib/enums/chat.enums.ts
 index 6dcede2a5e..43d64e9f84 100644
 --- a/tools/ui/src/lib/enums/chat.enums.ts
@@ -83,10 +119,40 @@ index 986cc46c72..a085fa7e9f 100644
  		}
  	}
 diff --git a/tools/ui/src/lib/types/chat.d.ts b/tools/ui/src/lib/types/chat.d.ts
-index 86a868c33a..1079c35f13 100644
+index 86a868c33a..5a1ca7da69 100644
 --- a/tools/ui/src/lib/types/chat.d.ts
 +++ b/tools/ui/src/lib/types/chat.d.ts
-@@ -220,6 +220,14 @@ export interface ChatCommandsOptions {
+@@ -3,6 +3,7 @@ import type { DatabaseMessage, DatabaseMessageExtra } from './database';
+ import type {
+ 	AttachmentAction,
+ 	AttachmentItemEnabledWhen,
++	AttachmentItemVisibleWhen,
+ 	AttachmentMenuItemId,
+ 	ChatFormCommandAction,
+ 	ErrorDialogType,
+@@ -29,6 +30,8 @@ export interface AttachmentMenuItem {
+ 	disabledTooltip?: string;
+ 	/** Callback key on the Props interface to invoke when clicked */
+ 	action: AttachmentAction;
++	/** Whether the item is only shown when a specific capability is present */
++	visibleWhen?: AttachmentItemVisibleWhen;
+ 	/** Whether this item has a tooltip even when enabled (uses dynamic text) */
+ 	hasEnabledTooltip?: boolean;
+ }
+@@ -40,6 +43,12 @@ export interface ChatUploadedFile {
+ 	type: string;
+ 	file: File;
+ 	preview?: string;
++	/**
++	 * Saved-to-disk location for an image the active model cannot see: the path a
++	 * vision-capable MCP tool reads, appended to the request as text when the
++	 * model is text-only. The user sees the preview, not the path.
++	 */
++	savedPath?: string;
+ 	textContent?: string;
+ 	mcpPrompt?: {
+ 		serverName: string;
+@@ -220,6 +229,14 @@ export interface ChatCommandsOptions {
  	hasPrompts: () => boolean;
  	/** Gates `/cwd`. */
  	hasCwdTools: () => boolean;
@@ -101,7 +167,7 @@ index 86a868c33a..1079c35f13 100644
  }
  
  /** Protocol-level verbs accepted by the realtime inference control endpoint. Mirrors `CONTROL_ACTION`. */
-@@ -228,6 +236,8 @@ export type ControlAction = 'reasoning_end';
+@@ -228,6 +245,8 @@ export type ControlAction = 'reasoning_end';
  export interface ChatFormCommand {
  	name: string;
  	description: string;
@@ -110,6 +176,27 @@ index 86a868c33a..1079c35f13 100644
  	/** Extra search terms that should match this command in the picker. */
  	keywords?: string[];
  	action: ChatFormCommandAction;
+@@ -249,7 +268,7 @@ export interface ChatMessageDeletionInfo {
+  * refresh + user-action notification), passed to each ChatMessage as a prop.
+  */
+ export interface ChatMessageActions {
+-	copy: (message: DatabaseMessage, contentOverride?: string) => void;
++	copy: (message: DatabaseMessage) => void;
+ 	delete: (message: DatabaseMessage) => void;
+ 	navigateToSibling: (siblingId: string) => void;
+ 	editWithBranching: (
+@@ -333,7 +352,11 @@ export interface ChatFormActionsContext {
+ 	readonly hasAudioModality: boolean;
+ 	readonly hasVideoModality: boolean;
+ 	readonly hasVisionModality: boolean;
++	readonly hasMcpPromptsSupport: boolean;
++	readonly hasMcpResourcesSupport: boolean;
+ 	onFileUpload?: () => void;
+ 	onSystemPromptClick?: () => void;
++	onMcpPromptClick?: () => void;
++	onMcpResourcesClick?: () => void;
+ 	onMcpSettingsClick?: () => void;
+ }
 diff --git a/tools/ui/src/lib/utils/chat-commands.ts b/tools/ui/src/lib/utils/chat-commands.ts
 index 9345f0a48e..164ba13770 100644
 --- a/tools/ui/src/lib/utils/chat-commands.ts
@@ -137,10 +224,10 @@ index 9345f0a48e..164ba13770 100644
  }
 diff --git a/tools/ui/src/lib/utils/panel-command-runtime.ts b/tools/ui/src/lib/utils/panel-command-runtime.ts
 new file mode 100644
-index 0000000000..0a6d9333d1
+index 0000000000..94bc82a5a2
 --- /dev/null
 +++ b/tools/ui/src/lib/utils/panel-command-runtime.ts
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,56 @@
 +/**
 + * The npm-packaged pieces the panel's own UI needs, re-exported for it.
 + *
@@ -174,6 +261,7 @@ index 0000000000..0a6d9333d1
 +	CircleQuestionMark,
 +	Copy,
 +	Download,
++	EyeOff,
 +	Folder,
 +	FolderPlus,
 +	Gauge,
@@ -187,6 +275,7 @@ index 0000000000..0a6d9333d1
 +	Plug,
 +	Plus,
 +	Receipt,
++	Scissors,
 +	Settings,
 +	ShieldCheck,
 +	Square,

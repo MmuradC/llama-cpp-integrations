@@ -1,0 +1,244 @@
+diff --git a/tools/ui/src/lib/components/pwa/PwaMetaTags.svelte b/tools/ui/src/lib/components/pwa/PwaMetaTags.svelte
+index 846251cd61..584f2ee834 100644
+--- a/tools/ui/src/lib/components/pwa/PwaMetaTags.svelte
++++ b/tools/ui/src/lib/components/pwa/PwaMetaTags.svelte
+@@ -6,20 +6,17 @@
+ 
+ <svelte:head>
+ 	<!-- Theme color for light/dark modes -->
+-	<meta content={THEME_COLORS.LIGHT} media={MEDIA_QUERIES.PREFERS_LIGHT} name="theme-color" />
+-
+-	<meta content={THEME_COLORS.DARK} media={MEDIA_QUERIES.PREFERS_DARK} name="theme-color" />
++	<meta name="theme-color" content={THEME_COLORS.LIGHT} media={MEDIA_QUERIES.PREFERS_LIGHT} />
++	<meta name="theme-color" content={THEME_COLORS.DARK} media={MEDIA_QUERIES.PREFERS_DARK} />
+ 
+ 	<!-- Apple mobile web app meta tags -->
+ 	<meta
+-		content={APPLE_META_TAGS.MOBILE_WEB_APP_CAPABLE.content}
+ 		name={APPLE_META_TAGS.MOBILE_WEB_APP_CAPABLE.name}
++		content={APPLE_META_TAGS.MOBILE_WEB_APP_CAPABLE.content}
+ 	/>
+-
+ 	<meta
+-		content={APPLE_META_TAGS.STATUS_BAR_STYLE.content}
+ 		name={APPLE_META_TAGS.STATUS_BAR_STYLE.name}
++		content={APPLE_META_TAGS.STATUS_BAR_STYLE.content}
+ 	/>
+-
+-	<meta content={appName} name={APPLE_META_TAGS.MOBILE_WEB_APP_TITLE.name} />
++	<meta name={APPLE_META_TAGS.MOBILE_WEB_APP_TITLE.name} content={appName} />
+ </svelte:head>
+diff --git a/tools/ui/src/lib/components/pwa/PwaRefreshAlert.svelte b/tools/ui/src/lib/components/pwa/PwaRefreshAlert.svelte
+index 56a71406ff..0976e96464 100644
+--- a/tools/ui/src/lib/components/pwa/PwaRefreshAlert.svelte
++++ b/tools/ui/src/lib/components/pwa/PwaRefreshAlert.svelte
+@@ -17,6 +17,7 @@
+ 
+ 			<Button
+ 				class="justify-self-end-safe"
++				size="sm"
+ 				onclick={() => {
+ 					updateServiceWorker();
+ 
+@@ -26,7 +27,6 @@
+ 
+ 					needRefresh = false;
+ 				}}
+-				size="sm"
+ 			>
+ 				Reload
+ 			</Button>
+diff --git a/tools/ui/src/lib/constants/attachment-menu.constants.ts b/tools/ui/src/lib/constants/attachment-menu.constants.ts
+index 143450a752..07ca17fad1 100644
+--- a/tools/ui/src/lib/constants/attachment-menu.constants.ts
++++ b/tools/ui/src/lib/constants/attachment-menu.constants.ts
+@@ -1,5 +1,11 @@
++import { FolderOpen, MessageSquare, Zap } from '@lucide/svelte';
+ import { FILE_TYPE_ICONS } from '$lib/constants';
+-import { AttachmentAction, AttachmentItemEnabledWhen, AttachmentMenuItemId } from '$lib/enums';
++import {
++	AttachmentAction,
++	AttachmentItemEnabledWhen,
++	AttachmentItemVisibleWhen,
++	AttachmentMenuItemId
++} from '$lib/enums';
+ import type { AttachmentMenuItem } from '$lib/types';
+ 
+ /**
+@@ -52,4 +58,36 @@ export const ATTACHMENT_FILE_ITEMS: AttachmentMenuItem[] = [
+ 	}
+ ];
+ 
++export const ATTACHMENT_EXTRA_ITEMS: AttachmentMenuItem[] = [];
++
++export const ATTACHMENT_PROMPT_ITEMS: AttachmentMenuItem[] = [
++	{
++		action: AttachmentAction.SYSTEM_PROMPT_CLICK,
++		enabledWhen: AttachmentItemEnabledWhen.ALWAYS,
++		hasEnabledTooltip: true,
++		icon: MessageSquare,
++		id: AttachmentMenuItemId.SYSTEM_MESSAGE,
++		label: 'System Message'
++	},
++	{
++		action: AttachmentAction.MCP_PROMPT_CLICK,
++		enabledWhen: AttachmentItemEnabledWhen.ALWAYS,
++		icon: Zap,
++		id: AttachmentMenuItemId.MCP_PROMPT,
++		label: 'MCP Prompts',
++		visibleWhen: AttachmentItemVisibleWhen.HAS_MCP_PROMPTS_SUPPORT
++	}
++];
++
++export const ATTACHMENT_MCP_ITEMS: AttachmentMenuItem[] = [
++	{
++		action: AttachmentAction.MCP_RESOURCES_CLICK,
++		enabledWhen: AttachmentItemEnabledWhen.ALWAYS,
++		icon: FolderOpen,
++		id: AttachmentMenuItemId.MCP_RESOURCES,
++		label: 'MCP Resources',
++		visibleWhen: AttachmentItemVisibleWhen.HAS_MCP_RESOURCES_SUPPORT
++	}
++];
++
+ export const ATTACHMENT_TOOLTIP_TEXT = 'Add files, prompts, tools or MCP Servers';
+diff --git a/tools/ui/src/lib/constants/pwa.constants.ts b/tools/ui/src/lib/constants/pwa.constants.ts
+index e807f4a97a..ade735bd29 100644
+--- a/tools/ui/src/lib/constants/pwa.constants.ts
++++ b/tools/ui/src/lib/constants/pwa.constants.ts
+@@ -318,6 +318,19 @@ export const SVELTEKIT_PWA_OPTIONS: SvelteKitPWAOptions = {
+ 
+ 	// Workbox configuration for generateSW strategy
+ 	workbox: {
++		// Take over from the previous service worker immediately instead of
++		// sitting in the `waiting` state until the page posts a SKIP_WAITING
++		// message. Without these, the old worker keeps serving its cached app
++		// shell for navigations, so a rebuilt UI is invisible until every tab
++		// of the app has been closed - clearing the browser cache does not help,
++		// because the stale response comes from the old worker's precache, not
++		// from the HTTP cache. With them, the new worker activates (and claims
++		// open pages) on the next load, so the following reload shows the new
++		// build. Paired with the version-mismatch alert in use-pwa.svelte.ts,
++		// which still offers the user an explicit reload.
++		skipWaiting: true,
++		clientsClaim: true,
++
+ 		// Match all static assets in the build output.
+ 		// Uses '**/' because SvelteKit outputs files under _app/immutable/
+ 		// subdirectories.
+diff --git a/tools/ui/src/lib/enums/attachment.enums.ts b/tools/ui/src/lib/enums/attachment.enums.ts
+index 5f096b9744..70ed36d89f 100644
+--- a/tools/ui/src/lib/enums/attachment.enums.ts
++++ b/tools/ui/src/lib/enums/attachment.enums.ts
+@@ -19,6 +19,8 @@ export enum AttachmentType {
+ export enum AttachmentMenuItemId {
+ 	AUDIO = 'audio',
+ 	IMAGES = 'images',
++	MCP_PROMPT = 'mcp-prompt',
++	MCP_RESOURCES = 'mcp-resources',
+ 	PDF = 'pdf',
+ 	SYSTEM_MESSAGE = 'system-message',
+ 	TEXT = 'text',
+@@ -40,6 +42,8 @@ export enum AttachmentItemEnabledWhen {
+  */
+ export enum AttachmentAction {
+ 	FILE_UPLOAD = 'onFileUpload',
++	MCP_PROMPT_CLICK = 'onMcpPromptClick',
++	MCP_RESOURCES_CLICK = 'onMcpResourcesClick',
+ 	SYSTEM_PROMPT_CLICK = 'onSystemPromptClick'
+ }
+ 
+@@ -52,3 +56,11 @@ export enum AttachmentLabel {
+ 	MCP_RESOURCE = 'MCP Resource',
+ 	PDF_FILE = 'PDF File'
+ }
++
++/**
++ * Visibility conditions for attachment menu items.
++ */
++export enum AttachmentItemVisibleWhen {
++	HAS_MCP_PROMPTS_SUPPORT = 'hasMcpPromptsSupport',
++	HAS_MCP_RESOURCES_SUPPORT = 'hasMcpResourcesSupport'
++}
+diff --git a/tools/ui/src/lib/hooks/use-attachment-menu.svelte.ts b/tools/ui/src/lib/hooks/use-attachment-menu.svelte.ts
+index c738c266a6..98ecc9ace0 100644
+--- a/tools/ui/src/lib/hooks/use-attachment-menu.svelte.ts
++++ b/tools/ui/src/lib/hooks/use-attachment-menu.svelte.ts
+@@ -5,16 +5,21 @@ export interface AttachmentModalityFlags {
+ 	hasVisionModality: boolean;
+ 	hasAudioModality: boolean;
+ 	hasVideoModality: boolean;
++	hasMcpPromptsSupport: boolean;
++	hasMcpResourcesSupport: boolean;
+ }
+ 
+ export interface AttachmentActionCallbacks {
+ 	onFileUpload?: () => void;
+ 	onSystemPromptClick?: () => void;
++	onMcpPromptClick?: () => void;
++	onMcpResourcesClick?: () => void;
+ }
+ 
+ export interface UseAttachmentMenuReturn {
+ 	readonly callbacks: Record<string, () => void>;
+ 	isItemEnabled(enabledWhen: string | undefined): boolean;
++	isItemVisible(visibleWhen: string | undefined): boolean;
+ 	getSystemMessageTooltip(): string;
+ }
+ 
+@@ -44,6 +49,8 @@ export function useAttachmentMenu(
+ 
+ 		return {
+ 			[AttachmentAction.FILE_UPLOAD]: wrap(cbs.onFileUpload),
++			[AttachmentAction.MCP_PROMPT_CLICK]: wrap(cbs.onMcpPromptClick),
++			[AttachmentAction.MCP_RESOURCES_CLICK]: wrap(cbs.onMcpResourcesClick),
+ 			[AttachmentAction.SYSTEM_PROMPT_CLICK]: wrap(cbs.onSystemPromptClick)
+ 		};
+ 	});
+@@ -54,6 +61,12 @@ export function useAttachmentMenu(
+ 		return !!modalityFlags[enabledWhen as keyof AttachmentModalityFlags];
+ 	}
+ 
++	function isItemVisible(visibleWhen: string | undefined): boolean {
++		if (!visibleWhen) return true;
++
++		return !!modalityFlags[visibleWhen as keyof AttachmentModalityFlags];
++	}
++
+ 	function getSystemMessageTooltip(): string {
+ 		return !page.params.id
+ 			? 'Add custom system message for a new conversation'
+@@ -65,6 +78,7 @@ export function useAttachmentMenu(
+ 			return callbacks;
+ 		},
+ 		getSystemMessageTooltip,
+-		isItemEnabled
++		isItemEnabled,
++		isItemVisible
+ 	};
+ }
+diff --git a/tools/ui/src/lib/hooks/use-pwa.svelte.ts b/tools/ui/src/lib/hooks/use-pwa.svelte.ts
+index 8d2ca2b0b5..a4e98ecf7a 100644
+--- a/tools/ui/src/lib/hooks/use-pwa.svelte.ts
++++ b/tools/ui/src/lib/hooks/use-pwa.svelte.ts
+@@ -1,6 +1,7 @@
+ import { browser } from '$app/environment';
+ import { BUILD_VERSION_LOCALSTORAGE_KEY, SW_CONFIG } from '$lib/constants';
+ import { versionStore } from '$lib/stores';
++import { chatStore } from '$lib/stores/chat/index.svelte';
+ import { useRegisterSW } from 'virtual:pwa-register/svelte';
+ 
+ /**
+@@ -27,6 +28,12 @@ export function usePwa() {
+ 			swCheckInterval = setInterval(async () => {
+ 				if (!r || r.installing || !navigator?.onLine) return;
+ 
++				// Skip the update check while a /compact is mid-run: r.update()
++				// can install and claim a fresh worker on top of an in-flight
++				// compaction. The next tick after it ends picks up the new build;
++				// waiting it out loses nothing.
++				if (chatStore.compactionRunning) return;
++
+ 				try {
+ 					const resp = await fetch(swUrl, {
+ 						cache: SW_CONFIG.UPDATE_FETCH_OPTIONS.CACHE,

@@ -1,4 +1,6 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from './panel-origin';
+import { syncMainFavorites } from './pinned-favorites';
 	// Lives entirely outside llama.cpp's own source tree — see ../README.md.
 	// Mirrors OpenRouterPage.svelte's structure exactly (same pin/favorite/
 	// copy pattern against a second provider) — see that file for the
@@ -14,11 +16,11 @@
 	import ProviderUsagePanel from './ProviderUsagePanel.svelte';
 	import { onMount } from 'svelte';
 
-	const MODELS_URL = 'http://127.0.0.1:9010/api/nim/models';
-	const PINNED_URL = 'http://127.0.0.1:9010/api/nim/pinned';
-	const CONTEXT_LIMITS_URL = 'http://127.0.0.1:9010/api/context-limits';
-	const PIN_URL = 'http://127.0.0.1:9010/api/nim/pin';
-	const UNPIN_URL = 'http://127.0.0.1:9010/api/nim/unpin';
+	const MODELS_URL = `${PANEL_ORIGIN}/api/nim/models`;
+	const PINNED_URL = `${PANEL_ORIGIN}/api/nim/pinned`;
+	const CONTEXT_LIMITS_URL = `${PANEL_ORIGIN}/api/context-limits`;
+	const PIN_URL = `${PANEL_ORIGIN}/api/nim/pin`;
+	const UNPIN_URL = `${PANEL_ORIGIN}/api/nim/unpin`;
 
 	type NimModel = { id: string };
 
@@ -123,6 +125,8 @@
 			if (wasPinned) next.delete(model.id);
 			else next.add(model.id);
 			pinnedIds = next;
+			// A pin is a favorite — fill the main dropdown's heart (see pinned-favorites).
+			syncMainFavorites(registeredId(model.id), !wasPinned);
 		} catch (err) {
 			pinError = err instanceof Error ? err.message : 'Failed to update pin';
 		} finally {
@@ -166,7 +170,7 @@
 	     OpenCode page via ProviderUsagePanel, which also documents why
 	     each provider gets a different shape (this one has no published usage figure at all). -->
 	<ProviderUsagePanel title="NVIDIA NIM requests"
-		url="http://127.0.0.1:9010/api/usage-summary"
+		url={`${PANEL_ORIGIN}/api/usage-summary`}
 		provider="nim" />
 
 	<div>
@@ -218,7 +222,9 @@
 	</div>
 
 	{#if models}
-		<Table.Root>
+		<!-- long real ids: let the table scroll on a phone instead of squishing -->
+		<div class="w-full overflow-x-auto">
+			<Table.Root class="min-w-[40rem]">
 			<Table.Header>
 				<Table.Row>
 					<Table.Head class="w-8"></Table.Head>
@@ -271,7 +277,8 @@
 					</Table.Row>
 				{/each}
 			</Table.Body>
-		</Table.Root>
+			</Table.Root>
+		</div>
 
 		{#if filtered.length > 200}
 			<p class="text-center text-xs text-muted-foreground">

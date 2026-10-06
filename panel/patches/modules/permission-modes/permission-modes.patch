@@ -1,0 +1,569 @@
+diff --git a/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionPermissionMode.svelte b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionPermissionMode.svelte
+new file mode 100644
+index 0000000000..bb4ff9c9f2
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionPermissionMode.svelte
+@@ -0,0 +1,147 @@
++<script lang="ts">
++	import { ChevronDown, Cog, Lock, Pencil, PlayCircle } from '@lucide/svelte';
++	import { DialogConfirmation } from '$lib/components/app';
++	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
++	import * as Tooltip from '$lib/components/ui/tooltip';
++	import { TOOLTIP_DELAY_DURATION } from '$lib/constants';
++	import { PERMISSION_MODE_LABELS } from '$lib/constants/agentic.constants';
++	import { conversationsStore, permissionModeStore } from '$lib/stores';
++	import type { PermissionMode } from '$lib/types/agentic';
++	import type { Component } from 'svelte';
++
++	interface Props {
++		disabled?: boolean;
++	}
++
++	let { disabled = false }: Props = $props();
++
++	const MODE_ICONS: Record<PermissionMode, Component> = {
++		'accept-edits': Pencil,
++		auto: PlayCircle,
++		manual: Lock,
++		plan: Cog
++	};
++
++	const MODE_OPTIONS: PermissionMode[] = ['manual', 'accept-edits', 'auto', 'plan'];
++
++	const MODE_DESCRIPTIONS: Record<PermissionMode, string> = {
++		'accept-edits':
++			'Approve in-place edits to existing files. Ask before creating or overwriting a file, and before everything else.',
++		auto: 'Run all tools without asking.',
++		manual: 'Ask before every tool call.',
++		plan: 'Show the plan before running any tool call.'
++	};
++
++	let dropdownOpen = $state(false);
++
++	let confirmOpen = $state(false);
++	let pendingMode: PermissionMode | null = null;
++
++	/**
++	 * The mode of the conversation in front of the user, not a global one: each
++	 * chat carries its own (see the store's chatModes), and on the new-chat
++	 * screen there is no conversation yet, so the picker sets the value the next
++	 * chat will start with.
++	 */
++	const activeConvId = $derived(conversationsStore.activeConversation?.id ?? null);
++	const activeMode = $derived(permissionModeStore.getModeFor(activeConvId));
++
++	function handleModeClick(newMode: PermissionMode) {
++		dropdownOpen = false;
++
++		if (newMode === 'auto' && activeMode !== 'auto') {
++			// Auto runs tools without asking, so confirm the switch like Claude's
++			// auto-accept dialog does. Cancel keeps the current mode.
++			pendingMode = newMode;
++			confirmOpen = true;
++
++			return;
++		}
++
++		permissionModeStore.setModeFor(activeConvId, newMode);
++	}
++
++	function confirmAuto() {
++		if (pendingMode) permissionModeStore.setModeFor(activeConvId, pendingMode);
++
++		pendingMode = null;
++		confirmOpen = false;
++	}
++
++	function cancelAuto() {
++		pendingMode = null;
++		confirmOpen = false;
++	}
++</script>
++
++{#snippet Icon(Comp: Component)}
++	<Comp class="h-3.5 w-3.5" />
++{/snippet}
++
++<DropdownMenu.Root bind:open={dropdownOpen} onOpenChange={(v) => (dropdownOpen = v)}>
++	<Tooltip.Root delayDuration={TOOLTIP_DELAY_DURATION} ignoreNonKeyboardFocus>
++		<Tooltip.Trigger>
++			{#snippet child({ props })}
++				<DropdownMenu.Trigger
++					{...props}
++					class="inline-flex cursor-pointer items-center gap-1.5 rounded-sm bg-background px-1.5 py-1 text-xs shadow-sm transition hover:bg-muted-foreground/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-muted-foreground/15 dark:text-secondary-foreground"
++					{disabled}
++				>
++					{@render Icon(MODE_ICONS[activeMode])}
++
++					<span class="truncate font-medium">
++						{PERMISSION_MODE_LABELS[activeMode]}
++					</span>
++
++					<ChevronDown class="h-3 w-3 shrink-0" />
++				</DropdownMenu.Trigger>
++			{/snippet}
++		</Tooltip.Trigger>
++
++		<Tooltip.Content>
++			<p>{MODE_DESCRIPTIONS[activeMode]}</p>
++		</Tooltip.Content>
++	</Tooltip.Root>
++
++	<DropdownMenu.Content align="start" class="w-64">
++		<DropdownMenu.Group>
++			<DropdownMenu.GroupHeading class="my-1 px-2 text-[11px] font-semibold text-muted-foreground/70">
++				Permission mode
++			</DropdownMenu.GroupHeading>
++
++			{#each MODE_OPTIONS as optionMode (optionMode)}
++				{@const isCurrent = optionMode === activeMode}
++
++				<DropdownMenu.Item
++					class="flex cursor-pointer flex-col items-start gap-0.5 py-1.5 {isCurrent
++						? 'bg-muted'
++						: ''}"
++					onclick={() => handleModeClick(optionMode)}
++				>
++					<span class="flex w-full items-center gap-2 text-sm font-medium">
++						{@render Icon(MODE_ICONS[optionMode])}
++
++						{PERMISSION_MODE_LABELS[optionMode]}
++					</span>
++
++					<span class="text-[11px] leading-tight text-muted-foreground">
++						{MODE_DESCRIPTIONS[optionMode]}
++
++						{#if isCurrent}
++							<span class="ml-1 font-medium">(current)</span>
++						{/if}
++					</span>
++				</DropdownMenu.Item>
++			{/each}
++		</DropdownMenu.Group>
++	</DropdownMenu.Content>
++</DropdownMenu.Root>
++
++<DialogConfirmation
++	bind:open={confirmOpen}
++	title="Switch to Auto?"
++	description="Auto lets the model run every tool call without asking — including shell commands. You can switch back at any time."
++	confirmText="Switch to Auto"
++	onConfirm={confirmAuto}
++	onCancel={cancelAuto}
++/>
+diff --git a/tools/ui/src/lib/constants/agentic.constants.ts b/tools/ui/src/lib/constants/agentic.constants.ts
+index 33fb30f1bd..78a10f78d3 100644
+--- a/tools/ui/src/lib/constants/agentic.constants.ts
++++ b/tools/ui/src/lib/constants/agentic.constants.ts
+@@ -1,4 +1,4 @@
+-import type { AgenticConfig } from '$lib/types/agentic';
++import type { AgenticConfig, PermissionMode } from '$lib/types/agentic';
+ 
+ export const ATTACHMENT_SAVED_REGEX = /\[Attachment saved: ([^\]]+)\]/;
+ 
+@@ -20,15 +20,90 @@ export const SEARCH_SUMMARY = {
+ // wraps mid-paragraph.
+ export const RESULT_STAT_SEPARATOR = ' - ';
+ 
+-// Separator between the assistant text sections of a grouped agentic
+-// session when they are joined for the clipboard.
+-export const AGENTIC_TEXT_COPY_SEPARATOR = '\n\n';
+-
+ export const DEFAULT_AGENTIC_CONFIG: AgenticConfig = {
+ 	enabled: true,
+ 	maxTurns: 100
+ } as const;
+ 
++// --- Runaway-flow guards ---------------------------------------------------
++
++/** Identical tool-call repeats (same names + arguments, any key order)
++ *  tolerated before the flow declares a wedge. One repeat is a legitimate
++ *  retry after a transient failure; the observed runaway re-issued the same
++ *  calls hundreds of times.
++ *
++ *  4 consecutive: attempt 1, then 3 unchanged retries. Higher values only
++ *  burn more tokens before the cutoff; lower ones misfire on models that
++ *  retry a failed call once with adjusted wording. */
++export const AGENTIC_LOOP_REPEAT_LIMIT = 4;
++
++/** Consecutive tool-calling turns with no visible reply text tolerated
++ *  before the flow stops itself. Models legitimately chain quiet tool calls
++ *  while working through a plan; the live runaway produced nothing but calls
++ *  for its entire run. */
++export const AGENTIC_SILENT_TURN_LIMIT = 8;
++
++/** How many times one flow may be extended past maxTurns via the "Continue"
++ *  prompt. Each extension resets the per-flow turn counter, so without a cap
++ *  a flow's only ceiling is a human noticing it - which is exactly how the
++ *  2026-09-26 runaway burned ~300 turns: the turn limit fired, the prompt was
++ *  answered, the counter reset, repeat. Five extensions is 5 × maxTurns
++ *  turns; anything beyond that is not a task, it is a stuck flow. */
++export const AGENTIC_MAX_CONTINUE_EXTENSIONS = 5;
++
++//
++// Permission modes (chat form combobox)
++//
++
++/** Identifiers mirrored by PermissionMode in types/agentic.d.ts. */
++export const PERMISSION_MODES = ['manual', 'accept-edits', 'auto', 'plan'] as const;
++
++/** First-visit mode when nothing is stored server- or device-side.
++ *
++ * `manual`, not `accept-edits`: this is also the mode the store falls back to
++ * when the panel backend cannot be reached, and a permissive default there is
++ * how a model ends up editing files with no prompt at all - the failure is
++ * silent, and the user sees a mode they never chose. Asking first is the safe
++ * default; auto-approval should be something the user opts into. */
++export const DEFAULT_PERMISSION_MODE: PermissionMode = 'manual';
++
++/** Human label + description per mode, keyed by PermissionMode. Use i18n-free
++ *  flat map so both the combobox and the gates can read the same literals. */
++export const PERMISSION_MODE_LABELS = {
++	'accept-edits': 'Accept Edits',
++	auto: 'Auto',
++	manual: 'Manual',
++	plan: 'Plan'
++} as const;
++
++/** Wire tool names automatically approved in accept-edits mode. Matches
++ *  BuiltInTool.SERVER_* values so MCP tools with the same name stay gated.
++ *
++ * EMPTY ON PURPOSE as of 2026-09-19: accept-edits no longer auto-approves
++ * anything, so both `edit_file` and `write_file` ask like every other tool.
++ *
++ * History, because this set has now been every way round:
++ *   - it held `edit_file` + `write_file`, so a model rewrote whole files with
++ *     no prompt anywhere in a mode whose description promised "the built-in
++ *     file edit tools" (the reported bug);
++ *   - then just `edit_file`, which still let in-place edits through unprompted;
++ *   - now nothing: the user wants Accept Edits to ask for edits too.
++ *
++ * The set is kept rather than deleted so the gate's condition stays in one
++ * piece and a name can be added back cheaply if that is wanted again. */
++export const EDIT_APPROVED_TOOLS = new Set<string>([]);
++
++import { PANEL_ORIGIN } from '@mcp-panel/panel-origin';
++
++/** localStorage fallback key when the panel backend is not reachable. */
++export const PERMISSION_MODE_LOCALSTORAGE_KEY = 'llama.permissionMode';
++
++/** Panel-backend endpoints backing permissionModeStore. The panel runs on the
++ *  same origin as the UI (derived, see panel-origin.ts), the same convention
++ *  RightBar.svelte uses - a hardcoded 127.0.0.1 breaks every remote browser. */
++export const PERMISSION_MODE_PANEL_ORIGIN = PANEL_ORIGIN;
++export const PERMISSION_MODE_API = `${PERMISSION_MODE_PANEL_ORIGIN}/api/permission-mode`;
++
+ export const REASONING_TAGS = {
+ 	END: '</think>',
+ 	START: '<think>'
+diff --git a/tools/ui/src/lib/stores/agentic/gates.svelte.ts b/tools/ui/src/lib/stores/agentic/gates.svelte.ts
+index 6b52fa3aff..7fb356b331 100644
+--- a/tools/ui/src/lib/stores/agentic/gates.svelte.ts
++++ b/tools/ui/src/lib/stores/agentic/gates.svelte.ts
+@@ -7,13 +7,26 @@
+  * resolvePermission/resolveContinue. Owned by agenticStore, no host coupling.
+  */
+ 
+-import { ToolPermissionDecision } from '$lib/enums';
++import { EDIT_APPROVED_TOOLS } from '$lib/constants/agentic.constants';
++import { ToolPermissionDecision, ToolSource } from '$lib/enums';
+ // direct imports between stores, not via the barrel, to avoid circular deps
++import { permissionModeStore } from '$lib/stores/permission-mode.svelte';
+ import { permissionsStore } from '$lib/stores/permissions.svelte';
+ import { toolsStore } from '$lib/stores/tools.svelte';
+ import type { DatabaseMessageExtra, SteeringMessage } from '$lib/types';
+ import { SvelteMap } from 'svelte/reactivity';
+ 
++/** Permission-key prefixes of MCP servers whose tools are revoked while the
++ *  gate runs in Plan mode: the search (duckduckgo / ddg_search) and fetch
++ *  servers are relatively slow network tools, and Plan mode's point is asking
++ *  before acting — a remembered "always allow" must not auto-approve them
++ *  there. Other modes are untouched. */
++const PLAN_MODE_REVOKED_SERVER_PREFIXES = ['mcp-search:', 'mcp-fetch:'];
++
++/** Wire names of the same servers, for keys without an mcp-<serverId>
++ *  prefix. */
++const PLAN_MODE_REVOKED_TOOL_NAMES = new Set(['search', 'ddg_search', 'fetch', 'fetch_content']);
++
+ export class AgenticGates {
+ 	/** Resolve functions for pending continue Promises; nothing derives from this map */
+ 	private continueResolvers = new SvelteMap<string, (shouldContinue: boolean) => void>();
+@@ -23,7 +36,7 @@ export class AgenticGates {
+ 	/** Dedicated reactive state for pending permission requests (ensures immediate UI updates) */
+ 	private pendingPermissions = new SvelteMap<
+ 		string,
+-		{ toolName: string; serverLabel: string } | null
++		{ toolName: string; serverLabel: string; plan: boolean } | null
+ 	>();
+ 	/** Resolve functions for pending permission Promises; nothing derives from this map */
+ 	private permissionResolvers = new SvelteMap<string, (decision: ToolPermissionDecision) => void>();
+@@ -69,7 +82,7 @@ export class AgenticGates {
+ 
+ 	getPendingPermissionRequest(
+ 		conversationId: string
+-	): { toolName: string; serverLabel: string } | null {
++	): { toolName: string; serverLabel: string; plan: boolean } | null {
+ 		return this.pendingPermissions.get(conversationId) ?? null;
+ 	}
+ 
+@@ -135,13 +148,62 @@ export class AgenticGates {
+ 		serverLabel: string,
+ 		signal?: AbortSignal
+ 	): Promise<ToolPermissionDecision> {
++		// The mode for THIS conversation: a per-chat override when the panel has
++		// one, otherwise the global mode. Using the conversation id matters -
++		// several chats can be running at once, each with its own mode.
++		const mode = permissionModeStore.getModeFor(conversationId);
+ 		const permissionKey = toolsStore.getPermissionKey(toolName);
+ 
+-		if (permissionKey && permissionsStore.hasTool(permissionKey)) {
++		// Auto approves every call without prompting.
++		if (mode === 'auto') {
++			return ToolPermissionDecision.ONCE;
++		}
++
++		// Accept Edits auto-approves the built-in in-place edit tool only;
++		// everything else (notably shell, file moves and MCP tools) still prompts.
++		if (
++			mode === 'accept-edits' &&
++			EDIT_APPROVED_TOOLS.has(toolName) &&
++			toolsStore.getToolSource(toolName) === ToolSource.SERVER
++		) {
+ 			return ToolPermissionDecision.ONCE;
+ 		}
+ 
+-		this.pendingPermissions.set(conversationId, { serverLabel, toolName });
++		// The always-allow list is consulted AFTER the mode, and it may only
++		// silence tools that cannot write.
++		//
++		// Two bugs got fixed here, both of the same shape - a remembered
++		// approval outranking what the user was looking at. It used to be
++		// consulted before the mode at all, so one "Always allow all tools from
++		// X" click, months earlier and invisible from the mode picker, let a
++		// file rename run with no prompt while the UI read "Manual". Then it was
++		// honoured in Accept Edits too, so the same remembered approval let
++		// move_file run unprompted there - a mode whose entire description is
++		// "approve in-place edits to existing files, ask before everything
++		// else". A tool that can modify state now always asks unless the mode
++		// is Auto (or it is the built-in in-place edit tool in Accept Edits).
++		const readOnly = !toolsStore.toolCanWrite(toolName);
++
++		// Plan mode revokes the network search/fetch servers: the point of plan
++		// is agreeing before acting, and a remembered "always allow" from a
++		// previous chat must not auto-approve them there. Stored grants stay
++		// intact for other modes; ALWAYS/ALWAYS_SERVER answered while in plan
++		// are resolved as allow-once so plan cannot permanently re-grant them.
++		const planRevoked =
++			mode === 'plan' &&
++			((permissionKey !== null &&
++				PLAN_MODE_REVOKED_SERVER_PREFIXES.some((p) => permissionKey.startsWith(p))) ||
++				PLAN_MODE_REVOKED_TOOL_NAMES.has(toolName));
++
++		if (readOnly && permissionKey && permissionsStore.hasTool(permissionKey) && !planRevoked) {
++			return ToolPermissionDecision.ONCE;
++		}
++
++		this.pendingPermissions.set(conversationId, {
++			plan: mode === 'plan',
++			serverLabel,
++			toolName
++		});
+ 
+ 		return new Promise<ToolPermissionDecision>((resolve) => {
+ 			if (signal?.aborted) {
+@@ -154,9 +216,12 @@ export class AgenticGates {
+ 			this.permissionResolvers.set(conversationId, (decision) => {
+ 				this.pendingPermissions.set(conversationId, null);
+ 
+-				if (decision === ToolPermissionDecision.ALWAYS && permissionKey) {
++				if (decision === ToolPermissionDecision.ALWAYS && permissionKey && !planRevoked) {
+ 					permissionsStore.allowTool(permissionKey);
+-				} else if (decision === ToolPermissionDecision.ALWAYS_SERVER) {
++				} else if (
++					decision === ToolPermissionDecision.ALWAYS_SERVER &&
++					!planRevoked
++				) {
+ 					const serverToolKeys = toolsStore.allTools
+ 						.filter((t) =>
+ 							t.serverName
+@@ -169,7 +234,11 @@ export class AgenticGates {
+ 					permissionsStore.allowTools(serverToolKeys);
+ 				}
+ 
+-				resolve(decision);
++				// Downgraded allow: while planRevoked, an "always" answer must
++				// only cover THIS call, not persist past the mode switch.
++				resolve(planRevoked && decision !== ToolPermissionDecision.DENY
++					? ToolPermissionDecision.ONCE
++					: decision);
+ 			});
+ 
+ 			signal?.addEventListener(
+diff --git a/tools/ui/src/lib/stores/permission-mode.svelte.ts b/tools/ui/src/lib/stores/permission-mode.svelte.ts
+new file mode 100644
+index 0000000000..ecccc6fb84
+--- /dev/null
++++ b/tools/ui/src/lib/stores/permission-mode.svelte.ts
+@@ -0,0 +1,162 @@
++/**
++ * permissionModeStore - Permission modes: one global default, per-chat overrides
++ *
++ * Owns the single mode the agentic loop's gates consult, plus per-conversation
++ * overrides. The global value is persisted on the panel backend (GET/POST
++ * /api/permission-mode) so it survives reloads and shares across browser tabs;
++ * it falls back to localStorage when the backend is unreachable (or on SSR).
++ *
++ * Per-chat overrides live with the panel (panel/frontend/chat-permission/),
++ * because that storage is the panel's own - see the chatModes field below.
++ */
++
++import { browser } from '$app/environment';
++import {
++	DEFAULT_PERMISSION_MODE,
++	PERMISSION_MODE_API,
++	PERMISSION_MODE_LOCALSTORAGE_KEY
++} from '$lib/constants/agentic.constants';
++import type { PermissionMode } from '$lib/types/agentic';
++
++class PermissionModeStore {
++	private _mode = $state<PermissionMode>(DEFAULT_PERMISSION_MODE);
++
++	/**
++	 * Per-conversation modes, keyed by conversation id.
++	 *
++	 * Populated and persisted by the panel (see
++	 * panel/frontend/chat-permission/store.svelte.ts), which owns that storage -
++	 * the app's own conversation schema is left alone. The gate consults this
++	 * with the id of the conversation a tool call belongs to, so one chat can be
++	 * Manual while another is Auto. A chat with no entry inherits the global
++	 * mode below, which is what makes the change opt-in: nothing shifts until a
++	 * chat is given a mode of its own.
++	 */
++	chatModes = $state<Record<string, PermissionMode>>({});
++
++	/** Installed by the panel, which is what stores a per-chat change. */
++	onChatModeChange: ((convId: string, mode: PermissionMode) => void) | null = null;
++
++	get mode(): PermissionMode {
++		return this._mode;
++	}
++
++	/** The mode for one conversation: its own if it has one, else the global one. */
++	getModeFor(convId?: string | null): PermissionMode {
++		return (convId && this.chatModes[convId]) || this._mode;
++	}
++
++	/**
++	 * Set the mode for one conversation. With no conversation yet - the
++	 * new-chat screen - it sets the global value instead, which is also what a
++	 * chat without an entry of its own inherits.
++	 */
++	setModeFor(convId: string | null | undefined, mode: PermissionMode): void {
++		if (!convId) {
++			this.setMode(mode);
++
++			return;
++		}
++
++		if (this.chatModes[convId] === mode) return;
++
++		this.chatModes = { ...this.chatModes, [convId]: mode };
++		this.onChatModeChange?.(convId, mode);
++	}
++
++	/** Replace the whole per-chat map, e.g. right after the panel loads it. */
++	replaceChatModes(modes: Record<string, PermissionMode>): void {
++		this.chatModes = { ...modes };
++	}
++
++	/**
++	 * Load the last used mode. Called by initStores() after migrations run:
++	 * prefers the panel backend value, falls back to localStorage, and falls
++	 * back to the default when neither has a valid entry.
++	 */
++	async initialize(): Promise<void> {
++		// browser-only network init: SSR runs with the default
++		if (!browser) return;
++
++		const remote = await this.fetchRemote();
++
++		if (remote) {
++			this._mode = remote;
++
++			return;
++		}
++
++		const local = this.loadLocal();
++
++		if (local) this._mode = local;
++	}
++
++	setMode(mode: PermissionMode): void {
++		this._mode = mode;
++
++		if (browser) {
++			try {
++				localStorage.setItem(PERMISSION_MODE_LOCALSTORAGE_KEY, mode);
++			} catch (err) {
++				console.error(`Failed to persist permission mode to local storage:`, err);
++			}
++
++			void this.pushRemote(mode);
++		}
++	}
++
++	private async fetchRemote(): Promise<PermissionMode | null> {
++		try {
++			const res = await fetch(PERMISSION_MODE_API, { signal: AbortSignal.timeout(6000) });
++
++			if (!res.ok) throw new Error(`status ${res.status}`);
++
++			const body = (await res.json()) as { mode: string };
++
++			return this.isValid(body?.mode) ? (body.mode as PermissionMode) : null;
++		} catch (err) {
++			// Silent: server may be a plain llama-server without the panel backend.
++			console.warn(`Failed to read permission mode from panel backend:`, err);
++
++			return null;
++		}
++	}
++
++	private isValid(value: unknown): boolean {
++		return (
++			typeof value === 'string' &&
++			(value === 'manual' || value === 'accept-edits' || value === 'auto' || value === 'plan')
++		);
++	}
++
++	private loadLocal(): PermissionMode | null {
++		try {
++			const stored = localStorage.getItem(PERMISSION_MODE_LOCALSTORAGE_KEY);
++
++			return this.isValid(stored) ? (stored as PermissionMode) : null;
++		} catch (err) {
++			console.error(`Failed to load permission mode from local storage:`, err);
++
++			return null;
++		}
++	}
++
++	private async pushRemote(mode: PermissionMode): Promise<void> {
++		try {
++			const res = await fetch(PERMISSION_MODE_API, {
++				body: JSON.stringify({ mode }),
++				headers: { 'Content-Type': 'application/json' },
++				method: 'POST',
++				signal: AbortSignal.timeout(6000)
++			});
++
++			if (!res.ok) throw new Error(`status ${res.status}`);
++		} catch (err) {
++			// Silent: the server may be a plain llama-server without the panel
++			// backend. Local storage already persisted the mode.
++			console.warn(`Failed to persist permission mode to panel backend:`, err);
++		}
++	}
++}
++
++export const permissionModeStore = new PermissionModeStore();

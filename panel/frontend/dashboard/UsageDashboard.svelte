@@ -1,4 +1,5 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from '../panel-origin';
 	// Usage dashboard for the New Chat screen: a GitHub-style calendar of the
 	// last 90 days, coloured by requests per day (the one unit all three
 	// providers share), with the current allowance beside it.
@@ -8,7 +9,6 @@
 	// /api/usage-summary (the live windows this machine already tracks).
 	import { toast } from '$lib/utils/panel-command-runtime';
 
-	const PANEL_ORIGIN = 'http://127.0.0.1:9010';
 	const DAYS = 90;
 	const WEEKDAY_LABELS = ['Mon', '', 'Wed', '', 'Fri', '', 'Sun'];
 	const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -238,7 +238,7 @@
 		     summary, and the card is sized to whatever space is left under the
 		     composer - on a short viewport that means it scrolls, and a summary
 		     below the fold is no summary at all. -->
-		<div class="grid grid-cols-4 gap-2 px-4 pt-3">
+		<div class="grid grid-cols-2 gap-2 px-4 pt-3 sm:grid-cols-4">
 			{#each stats as stat (stat.label)}
 				<div class="bg-muted/40 rounded-lg px-3 py-1.5">
 					<div class="text-lg leading-tight font-semibold tabular-nums">{stat.value}</div>

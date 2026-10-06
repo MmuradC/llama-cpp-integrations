@@ -1,4 +1,5 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from './panel-origin';
 	// Lives in panel/frontend, not the fork's UI tree — same reasoning as
 	// OpenRouterPage.svelte: the only thing this integration adds inside
 	// llama.cpp's own source is a two-line import in ChatFormActions.svelte
@@ -38,7 +39,7 @@
 				completion_tokens: number;
 		  };
 
-	const PANEL_URL = 'http://127.0.0.1:9010';
+	const PANEL_URL = PANEL_ORIGIN;
 	// One detail page per provider, served by the panel backend as plain
 	// HTML. Clicking the badge opens the full table rather than growing a
 	// popup inside the chat form — and those pages exist regardless of

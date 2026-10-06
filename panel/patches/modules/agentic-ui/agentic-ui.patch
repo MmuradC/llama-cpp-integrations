@@ -1,0 +1,620 @@
+diff --git a/tools/ui/src/lib/stores/agentic/index.svelte.ts b/tools/ui/src/lib/stores/agentic/index.svelte.ts
+index 50db1be0cc..adedba4af8 100644
+--- a/tools/ui/src/lib/stores/agentic/index.svelte.ts
++++ b/tools/ui/src/lib/stores/agentic/index.svelte.ts
+@@ -10,7 +10,11 @@
+  * the permission/continue/steering gates owned by {@link AgenticGates}.
+  */
+ 
+-import { DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
++import {
++	AGENTIC_MAX_CONTINUE_EXTENSIONS,
++	DEFAULT_AGENTIC_CONFIG,
++	NEWLINE
++} from '$lib/constants';
+ import {
+ 	AUDIO_MIME_TO_EXTENSION,
+ 	DATA_URI_BASE64_REGEX,
+@@ -32,6 +36,7 @@ import { ChatService } from '$lib/services';
+ import { ReadMediaService } from '$lib/services/read-media.service';
+ import { SandboxService } from '$lib/services/sandbox.service';
+ import { ToolsService } from '$lib/services/tools.service';
++import { AgenticLoopGuard } from '$lib/utils/agentic-loop-guard';
+ // direct imports between stores, not via the barrel, to avoid circular deps
+ import { AgenticGates } from '$lib/stores/agentic/gates.svelte';
+ import { conversationsStore } from '$lib/stores/conversations/index.svelte';
+@@ -44,6 +49,7 @@ import type {
+ 	AgenticFlowParams,
+ 	AgenticFlowResult,
+ 	AgenticSession,
++	McpServerOverride,
+ 	MCPToolCall,
+ 	SettingsConfigType,
+ 	ToolExecutionResult
+@@ -200,10 +206,10 @@ class AgenticStore {
+ 		return active;
+ 	}
+ 
+-	getConfig(settings: SettingsConfigType): AgenticConfig {
++	getConfig(settings: SettingsConfigType, perChatOverrides?: McpServerOverride[]): AgenticConfig {
+ 		const maxTurns = Number(settings.agenticMaxTurns) || DEFAULT_AGENTIC_CONFIG.maxTurns;
+ 		const hasTools =
+-			mcpStore.hasEnabledServers() ||
++			mcpStore.hasEnabledServers(perChatOverrides) ||
+ 			toolsStore.serverTools.length > 0 ||
+ 			toolsStore.browserTools.length > 0 ||
+ 			toolsStore.customTools.length > 0;
+@@ -242,7 +248,7 @@ class AgenticStore {
+ 
+ 	getPendingPermissionRequest(
+ 		conversationId: string
+-	): { toolName: string; serverLabel: string } | null {
++	): { toolName: string; serverLabel: string; plan: boolean } | null {
+ 		return this.gates.getPendingPermissionRequest(conversationId);
+ 	}
+ 
+@@ -308,8 +314,8 @@ class AgenticStore {
+ 			flowRootMessageId,
+ 			messages,
+ 			options = {},
+-			signal,
+-			toolPolicy
++			perChatOverrides,
++			signal
+ 		} = params;
+ 
+ 		// Clear any pending permissions/continue requests for this conversation when starting a new flow
+@@ -320,28 +326,21 @@ class AgenticStore {
+ 			await toolsStore.fetchServerTools();
+ 		}
+ 
+-		const agenticConfig = this.getConfig(settingsStore.config);
++		const agenticConfig = this.getConfig(settingsStore.config, perChatOverrides);
+ 
+ 		if (!agenticConfig.enabled) return { handled: false };
+ 
+-		// callers without an explicit policy fall back to the global defaults
+-		const disabledTools = new Set(toolPolicy?.disabledTools ?? toolsStore.disabledTools);
+-		const disabledToolCategories = new Set(
+-			toolPolicy?.disabledToolCategories ?? toolsStore.disabledToolCategories
+-		);
+-		// initialize every settings-enabled server; tool collection filters by this
+-		// flow's policy, so switching policies never re-initializes connections
+-		const hasMcpServers = conversationsStore.preferences.policyEnabledServerIds().length > 0;
++		const hasMcpServers = mcpStore.hasEnabledServers(perChatOverrides);
+ 
+ 		if (hasMcpServers) {
+-			const initialized = await mcpStore.ensureInitialized();
++			const initialized = await mcpStore.ensureInitialized(perChatOverrides);
+ 
+ 			if (!initialized) {
+ 				console.log('[AgenticStore] MCP not initialized');
+ 			}
+ 		}
+ 
+-		const tools = toolsStore.getEnabledToolsForLLM(disabledTools, disabledToolCategories);
++		const tools = toolsStore.getEnabledToolsForLLM();
+ 
+ 		if (tools.length === 0) {
+ 			return { handled: false };
+@@ -464,10 +463,37 @@ class AgenticStore {
+ 		const maxTurns = agenticConfig.maxTurns;
+ 		const effectiveModel = options.model || modelsStore.models[0]?.model || '';
+ 
++		// Runaway-flow detection. See lib/utils/agentic-loop-guard.ts for why
++		// this exists - the live runaway re-issued identical tool calls for 90
++		// minutes because the turn limit was the only exit and "Continue" resets it.
++		const loopGuard = new AgenticLoopGuard();
++
+ 		let turn = 0;
++		// "Continue" extensions spent so far in this flow; see the turn-limit
++		// branch below and AGENTIC_MAX_CONTINUE_EXTENSIONS in the constants.
++		let continueExtensions = 0;
+ 
+ 		while (true) {
+ 			if (turn >= maxTurns) {
++				// Extension budget spent - terminate unconditionally. Before the
++				// cap this branch waited on requestContinue for every extension,
++				// so a wedged flow could loop indefinitely as long as somebody
++				// (or muscle memory) kept clicking Continue.
++				if (continueExtensions >= AGENTIC_MAX_CONTINUE_EXTENSIONS) {
++					console.warn(
++						`[AgenticStore] Continue extension budget exhausted after ${continueExtensions} extensions, terminating flow in conversation ${conversationId}`
++					);
++
++					this.updateSession(conversationId, {
++						lastError: new Error(
++							`Stopped: this flow extended past its ${maxTurns}-turn limit ${continueExtensions} times without finishing. Reply below with what to do next.`
++						)
++					});
++					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
++
++					return;
++				}
++
+ 				// Turn limit reached - ask user whether to continue
+ 				const shouldContinue = await this.gates.requestContinue(conversationId, signal);
+ 
+@@ -482,6 +508,7 @@ class AgenticStore {
+ 
+ 				// User chose to continue - extend the limit
+ 				turn = 0;
++				continueExtensions++;
+ 			}
+ 
+ 			this.updateSession(conversationId, { currentTurn: turn + 1 });
+@@ -983,6 +1010,42 @@ class AgenticStore {
+ 				return;
+ 			}
+ 
++			// Runaway-flow guard: judge the turn we just completed before paying
++			// for another one. A stop verdict exits the flow the same way a final
++			// turn does, but leaves the verdict as the session's lastError so the
++			// chat shows what happened instead of silently going quiet.
++			const loopVerdict = loopGuard.recordTurn(turnContent, normalizedCalls);
++
++			if (loopVerdict) {
++				console.warn(
++					`[AgenticStore] ${loopVerdict.reason}: stopping flow in conversation ${conversationId}`
++				);
++
++				// The turn already completed and persisted its tool calls; close it
++				// out with the same final-message path a normal exit uses, then
++				// record the reason where the UI already reads it.
++				agenticTimings.perTurn!.push(turnStats);
++				const finalTimings = this.buildFinalTimings(capturedTimings, agenticTimings);
++
++				await onAssistantTurnComplete?.(
++					turnContent,
++					turnReasoningContent || undefined,
++					finalTimings,
++					turnToolCalls.length > 0 ? this.normalizeToolCalls(turnToolCalls) : undefined
++				);
++				onFlowComplete?.(finalTimings);
++
++				this.updateSession(conversationId, {
++					lastError: new Error(loopVerdict.message)
++				});
++				// Not calling callbacks.onError here: the send path's onError
++				// deliberately rethrows to surface real stream failures, which
++				// would unwind this graceful stop as a crash. The chat already
++				// renders session lastError on the final assistant message.
++
++				return;
++			}
++
+ 			turn++;
+ 		}
+ 	}
+diff --git a/tools/ui/src/lib/types/agentic.d.ts b/tools/ui/src/lib/types/agentic.d.ts
+index c60e283fb6..4bd5f9f64d 100644
+--- a/tools/ui/src/lib/types/agentic.d.ts
++++ b/tools/ui/src/lib/types/agentic.d.ts
+@@ -15,7 +15,7 @@ import type {
+ 	DatabaseMessageExtraAudioFile,
+ 	DatabaseMessageExtraImageFile
+ } from './database';
+-import type { MessageRole, ToolSource } from '$lib/enums';
++import type { MessageRole } from '$lib/enums';
+ import { AgenticSectionType, ContinueIntentKind, ToolCallType } from '$lib/enums';
+ 
+ /**
+@@ -26,6 +26,16 @@ export interface AgenticConfig {
+ 	maxTurns: number;
+ }
+ 
++/**
++ * How the model's tool calls are gated. Selectable from the chat form's
++ * permission-mode combobox (next to the add button).
++ */
++export type PermissionMode =
++	| 'manual'
++	| 'accept-edits'
++	| 'auto'
++	| 'plan';
++
+ /**
+  * Tool call payload for agentic messages.
+  */
+@@ -162,12 +172,6 @@ export interface AgenticFlowOptions {
+ /**
+  * Parameters for starting an agentic flow
+  */
+-/** Per-conversation tool policy, captured at flow start */
+-export interface AgenticToolPolicy {
+-	disabledToolCategories: ToolSource[];
+-	disabledTools: string[];
+-}
+-
+ export interface AgenticFlowParams {
+ 	conversationId: string;
+ 	/** ID of the flow's first assistant message, used to keep its stats live */
+@@ -176,7 +180,7 @@ export interface AgenticFlowParams {
+ 	options?: AgenticFlowOptions;
+ 	callbacks: AgenticFlowCallbacks;
+ 	signal?: AbortSignal;
+-	toolPolicy?: AgenticToolPolicy;
++	perChatOverrides?: McpServerOverride[];
+ }
+ 
+ /**
+diff --git a/tools/ui/src/lib/utils/agentic-loop-guard.ts b/tools/ui/src/lib/utils/agentic-loop-guard.ts
+new file mode 100644
+index 0000000000..8aacfb2dad
+--- /dev/null
++++ b/tools/ui/src/lib/utils/agentic-loop-guard.ts
+@@ -0,0 +1,180 @@
++/**
++ * Unproductive-loop detection for agentic flows.
++ *
++ * The bug this pins down, observed live on 2026-09-26: an agentic flow ran a
++ * `while (true)` turn loop whose only bound was `maxTurns` — and every
++ * "Continue" click reset that counter. A model that wedged into re-issuing
++ * the same tool calls grew the conversation by 3 messages per turn for 90
++ * minutes (~300 turns, 75 paid LLM calls) with nobody watching, and the only
++ * thing that ever stopped it was the user reloading the page.
++ *
++ * This module is the detection half of the fix. It is pure: it sees one
++ * completed turn at a time and decides whether the flow has stopped making
++ * progress. The agentic store owns the wiring (persist the turn, surface the
++ * verdict as the session's lastError, exit the loop).
++ *
++ * Two independent signals, both counted per flow invocation:
++ *
++ *  - identical tool calls: the same set of tool calls (same names, same
++ *    canonicalized arguments) issued AGENTIC_LOOP_REPEAT_LIMIT turns in a
++ *    row. One identical repeat is a legitimate retry; four is a wedge.
++ *  - silent tool spam: AGENTIC_SILENT_TURN_LIMIT consecutive tool-calling
++ *    turns with no visible reply text. Reading three files silently on the
++ *    way to an answer is fine; eight turns of nothing but tool calls with no
++ *    narration is not something a user meant to pay for.
++ */
++
++/** Canonical limit defaults; see agentic.constants.ts for rationale. */
++import { AGENTIC_LOOP_REPEAT_LIMIT, AGENTIC_SILENT_TURN_LIMIT } from '$lib/constants';
++
++/** Structural shape the guard needs; the loop's ApiChatCompletionToolCall
++ *  satisfies it, and tests can build plain objects. */
++export interface LoopGuardToolCall {
++	function: {
++		arguments?: string;
++		name: string;
++	};
++}
++
++export type LoopGuardStopReason = 'identical-calls' | 'silent-turns';
++
++export interface LoopGuardVerdict {
++	message: string;
++	reason: LoopGuardStopReason;
++}
++
++/** Sort object keys and re-stringify so `{a:1,b:2}` and `{b:2,a:1}` compare
++ *  equal; JSON key order is not part of a call's meaning. Falls back to the
++ *  raw string for non-JSON arguments (some models emit bare text there). */
++export function canonicalizeToolArguments(raw: string | undefined): string {
++	if (!raw) return '';
++
++	try {
++		const parsed: unknown = JSON.parse(raw);
++
++		if (parsed === null || typeof parsed !== 'object') return raw;
++
++		return JSON.stringify(sortObjectKeys(parsed as Record<string, unknown>));
++	} catch {
++		return raw;
++	}
++}
++
++function sortObjectKeys(value: Record<string, unknown>): Record<string, unknown> {
++	const result: Record<string, unknown> = {};
++
++	for (const key of Object.keys(value).sort()) {
++		const entry = value[key];
++
++		result[key] = entry && typeof entry === 'object' && !Array.isArray(entry)
++			? sortObjectKeys(entry as Record<string, unknown>)
++			: entry;
++	}
++
++	return result;
++}
++
++/** Order-independent signature of one turn's tool calls. An empty set of
++ *  calls yields null (the turn made no calls, nothing to repeat). */
++export function toolCallsSignature(calls: LoopGuardToolCall[]): string | null {
++	if (calls.length === 0) return null;
++
++	return calls
++		.map((call) => `${call.function.name}(${canonicalizeToolArguments(call.function.arguments)})`)
++		.sort()
++		.join('|');
++}
++
++/** Human-facing explanation for a stopped flow. The chat surfaces this as the
++ *  session error on the last assistant message, so it has to say what
++ *  happened and what to do next, not just that something stopped. */
++export function buildLoopStopMessage(
++	reason: LoopGuardStopReason,
++	detail: string,
++	limit: number
++): string {
++	if (reason === 'identical-calls') {
++		return `Stopped an endless tool loop: ${detail} was issued ${limit} turns in a row with the same arguments and nothing new happened. Reply below to take over — rephrase the task or tell the model what to do differently.`;
++	}
++
++	return `Stopped an unproductive agentic run: ${detail} tool-calling turns in a row produced no visible reply. Reply below to take over.`;
++}
++
++export class AgenticLoopGuard {
++	private lastSignature: string | null = null;
++	private repeatCount = 0;
++	private silentStreak = 0;
++
++	constructor(
++		private readonly repeatLimit: number = AGENTIC_LOOP_REPEAT_LIMIT,
++		private readonly silentLimit: number = AGENTIC_SILENT_TURN_LIMIT
++	) {}
++
++	/** Forget history. Used when the user explicitly extends the flow, so a
++	 *  verdict earned before the extension cannot re-trigger immediately. */
++	reset(): void {
++		this.lastSignature = null;
++		this.repeatCount = 0;
++		this.silentStreak = 0;
++	}
++
++	/** Record one completed turn. Returns a verdict when the flow should stop
++	 *  itself, null while it is still making (or at least changing) moves. */
++	recordTurn(content: string, toolCalls: LoopGuardToolCall[]): LoopGuardVerdict | null {
++		const signature = toolCallsSignature(toolCalls);
++
++		if (signature) {
++			if (signature === this.lastSignature) {
++				this.repeatCount++;
++
++				if (this.repeatCount + 1 >= this.repeatLimit) {
++					return {
++						message: buildLoopStopMessage(
++							'identical-calls',
++							`the same tool call${toolCalls.length > 1 ? 's' : ''} (${describeCalls(toolCalls)})`,
++							this.repeatLimit
++						),
++						reason: 'identical-calls'
++					};
++				}
++			} else {
++				this.lastSignature = signature;
++				this.repeatCount = 0;
++			}
++
++			// A turn the model spends narrating is a turn it used its own output:
++			// re-reading the same file after explaining why is a deliberate recheck,
++			// not a wedge. Only silent repeats accumulate toward the verdict.
++			if (content.trim()) this.repeatCount = 0;
++		} else {
++			this.lastSignature = null;
++			this.repeatCount = 0;
++		}
++
++		// A turn that carries tool calls but no user-visible text counts toward
++		// the silent streak; any turn with visible content resets it. Turns
++		// without tool calls end the flow before this ever matters.
++		if (toolCalls.length > 0 && !content.trim()) {
++			this.silentStreak++;
++
++			if (this.silentStreak >= this.silentLimit) {
++				return {
++					message: buildLoopStopMessage(
++						'silent-turns',
++						`${this.silentLimit} consecutive`,
++						this.silentLimit
++					),
++					reason: 'silent-turns'
++				};
++			}
++		} else {
++			this.silentStreak = 0;
++		}
++
++		return null;
++	}
++}
++
++function describeCalls(calls: LoopGuardToolCall[]): string {
++	return calls.map((call) => call.function.name).join(', ');
++}
+diff --git a/tools/ui/src/lib/utils/compaction-tool-distill.ts b/tools/ui/src/lib/utils/compaction-tool-distill.ts
+new file mode 100644
+index 0000000000..3f7e451998
+--- /dev/null
++++ b/tools/ui/src/lib/utils/compaction-tool-distill.ts
+@@ -0,0 +1,188 @@
++/**
++ * Tool-result distillation for compaction (LLMLingua-style, heuristic tier).
++ *
++ * Why: compactConversation builds its transcript from USER + ASSISTANT turns
++ * only, so the model never re-sees facts it itself surfaced through tools —
++ * file paths, commands, error messages, service state. On this user's
++ * conversations tool results are 87% of transcript bytes, and the residue
++ * that turned out to matter after compaction was precisely those facts.
++ *
++ * What this module does: a deterministic, offline (no extra model calls)
++ * reduction of one tool result to its load-bearing lines —
++ *   - error/tail lines (they are usually the *finding*),
++ *   - paths and command lines,
++ *   - enough head for context,
++ *   - de-duplicated and binary noise dropped,
++ * every rule chosen because compaction asking for "every fact" is exactly
++ * what a summarizer cannot recover once the raw dump is gone.
++ *
++ * Deliberately NOT a small-model compressor (that is LLMLingua's learnable
++ * tier): keep it regex-grade so the same output is reproducible in a test
++ * environment, explainable in a diff, and free.
++ */
++
++/** Hard cap per tool message, applied after selection. */
++export const TOOL_DISTILL_MAX_CHARS = 2000;
++
++/** How many head lines survive verbatim (context for where the tool was). */
++export const HEAD_LINES = 10;
++
++/** How many tail lines survive verbatim (where findings usually live). */
++export const TAIL_LINES = 14;
++
++/** Lines worth keeping from the middle, matched case-insensitively. */
++const MIDDLE_KEEP_RE =
++	/(error|failed|failure|rejected|denied|forbidden|exception|traceback|fatal|invalid|timed? ?out|refused|exceeded|not found|unavailable|retrying|active|inactive|running|loaded|unloaded|exit code|status:)/i;
++
++/** Path-ish or command-ish tokens to keep from the middle. */
++const PATH_RE = /(\/[\w@%\-+.\\/]{3,}|~\/[\w\-+.\\/]+|\.{1,2}\/[\w\-+.\\/]+)/;
++const CMD_RE = /(^\s*[\$#]?\s*(sudo |systemctl |journalctl |curl |git |python3? |npm |node |llama-|make |pip |find |grep )\b|\b(\.\/|bash|sh|zsh)\b)/i;
++
++/** A JSON/script code fence or payload start. Keep structured data heads. */
++const STRUCTURED_RE = /^(\s*[\{\[<]|=== |\-\-\- |#!)/;
++
++/**
++ * Ratio of non-printable characters above which we call a line binary noise
++ * (ELF dumps, base64 blobs, minified data). Those lines destroy summary
++ * quality: they tokenize densely and carry nothing factual that survives.
++ */
++function isBinaryNoise(line: string): boolean {
++	if (line.length === 0) return false;
++	let weird = 0;
++	for (let i = 0; i < line.length; i++) {
++		const c = line.charCodeAt(i);
++		if (c < 9 || (c > 13 && c < 32) || c > 0xff) weird++;
++	}
++	return weird / line.length > 0.12;
++}
++
++function looksLikeBase64(line: string): boolean {
++	if (line.length < 40) return false;
++	const cut = line.replace(/[\s"']/g, '');
++	if (!cut.length) return false;
++	return /^[A-Za-z0-9+/=._-]*$/.test(cut) && !/[ ]{2}/.test(line) && !/%|^#!/.test(line) &&
++		// a long token without a single space is data, not prose; prose errs on the side of short words
++		cut.split(/[A-Za-z]/).length > cut.length * 0.9;
++}
++
++/** Collapse runs of identical lines into one marker line. */
++function dedupeLines(lines: string[]): string[] {
++	const out: string[] = [];
++	let i = 0;
++	while (i < lines.length) {
++		let j = i;
++		while (j + 1 < lines.length && lines[j + 1] === lines[i]) j++;
++		const run = j - i + 1;
++		out.push(run > 3 ? `${lines[i]} [repeated x${run}]` : lines[i]);
++		i = j + 1;
++	}
++	return out;
++}
++
++/**
++ * Reduce one tool result to its load-bearing lines.
++ *
++ * @param content raw tool-result text
++ * @param maxChars budget for the returned string (default TOOL_DISTILL_MAX_CHARS)
++ * @returns distilled text, never empty ( '[no output]' ) and always <= maxChars,
++ *          with a trailing accounting line so a human can audit what was kept.
++ */
++export function distillToolResult(content: string, maxChars: number = TOOL_DISTILL_MAX_CHARS): string {
++	const raw = content ?? '';
++	if (!raw || !raw.trim()) return '[tool produced no output]';
++
++	const lines = raw.replace(/\r\n/g, '\n').split('\n');
++	const clean = dedupeLines(
++		lines.filter((l) => !isBinaryNoise(l))
++	);
++
++	// score-based middle selection: what to keep from the unkept region
++	const scored: number[] = clean.map((l) => {
++		if (MIDDLE_KEEP_RE.test(l)) return 3;
++		if (PATH_RE.test(l)) return 2;
++		if (CMD_RE.test(l)) return 2;
++		if (STRUCTURED_RE.test(l)) return 1;
++		if (looksLikeBase64(l)) return -1;
++		return 0;
++	});
++
++	// index set: preserve order of head, middle, tail.
++	// Head (6) outranks tail (5) on purpose: the drop loop removes the
++	// lowest score first, and if head and tail tie they get dropped by
++	// insertion order — which would eat the head (the response's opening
++	// context) before the tail. Observed as a real failure: a structured
++	// JSON result lost its first lines while a repeated filler line that
++	// scored nothing survived to the end.
++	const keptIdx = new Map<number, number>(); // idx -> score
++	for (let i = 0; i < Math.min(HEAD_LINES, clean.length); i++) keptIdx.set(i, 6);
++	for (let i = Math.max(HEAD_LINES, clean.length - TAIL_LINES); i < clean.length; i++)
++		keptIdx.set(i, 5);
++
++	for (let i = HEAD_LINES; i < clean.length - TAIL_LINES; i++) {
++		if (scored[i] > 0) keptIdx.set(i, keptIdx.get(i) ?? scored[i]);
++	}
++
++	// if the kept set alone busts the budget, drop lowest-score first
++	let kept = [...keptIdx.keys()].sort((a, b) => a - b);
++	let text = () => kept.map((i) => clean[i]).join('\n');
++	const ellip = '\u2026';
++	while (kept.length > 1 && text().length + 40 > maxChars) {
++		// drop lowest scored, latest-inserted first so head/tail anchors survive:
++		// score order is middle (0..3) < tail (5) < head (6), so the head is
++		// dropped only when literally nothing else can be shed and one line
++		// must remain
++		const order = kept
++			.map((i, rank) => ({ i, rank, s: keptIdx.get(i) ?? 0 }))
++			.sort((a, b) => a.s - b.s || b.rank - a.rank);
++		// all-shown fallback prefers the LAST inserted line (highest rank, the
++		// tail end) over the head: order[0] is the newest because the sort
++		// already put ties in descending insertion order
++		const victim = order.find((o) => o.s < 6) ?? order[0];
++		kept = kept.filter((i) => i !== victim.i);
++	}
++
++	let body = text();
++	if (body.length > maxChars) body = body.slice(0, maxChars - 1) + ellip;
++
++	const accounted =
++		body.length + 40 <= maxChars
++			? `\n[distilled: ${kept.length} of ${clean.length} kept lines, ${raw.length} -> ${body.length} chars]`
++			: '';
++	return (body + accounted).trim() || '[no output]';
++}
++
++/**
++ * Map each role:'tool' message to the tool name its assistant caller
++ * executed, using the assistant's serialized toolCalls array.
++ *
++ * @param toolMessages   the tool-role messages in conversation order
++ * @param allMessages    the whole conversation (assistant messages carry toolCalls JSON)
++ */
++export function resolveToolNames(
++	toolMessages: { id: string; toolCallId?: string }[],
++	allMessages: { id: string; role: string; toolCalls?: string }[]
++): Map<string, string> {
++	const callsById = new Map<string, string>();
++	for (const m of allMessages) {
++		if (m.role !== 'assistant' || !m.toolCalls) continue;
++		try {
++			const parsed = JSON.parse(m.toolCalls) as {
++				id?: string;
++				function?: { name?: string };
++			}[];
++			if (Array.isArray(parsed)) {
++				for (const call of parsed) {
++					if (call?.id && call?.function?.name) callsById.set(call.id, call.function.name);
++				}
++			}
++		} catch {
++			// a corrupt toolCalls string must never break compaction
++		}
++	}
++
++	const names = new Map<string, string>();
++	for (const t of toolMessages) {
++		names.set(t.id, callsById.get(t.toolCallId ?? '') ?? 'tool');
++	}
++	return names;
++}

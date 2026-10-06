@@ -1,0 +1,349 @@
+diff --git a/tools/ui/src/lib/services/database.service.ts b/tools/ui/src/lib/services/database.service.ts
+index a466f84831..11316b2ade 100644
+--- a/tools/ui/src/lib/services/database.service.ts
++++ b/tools/ui/src/lib/services/database.service.ts
+@@ -8,10 +8,11 @@
+ 
+ import { IDXDB_STORES, IDXDB_TABLES, STORAGE_APP_NAME } from '$lib/constants';
+ import { MessageRole } from '$lib/enums';
++import Dexie, { type EntityTable } from 'dexie';
+ import type { McpServerOverride } from '$lib/types/database';
+ import type { ExportedConversation } from '$lib/types/database';
++import { incognitoChatStore } from '$lib/stores/incognito-chat.svelte';
+ import { filterByLeafNodeId, findDescendantMessages, uuid } from '$lib/utils';
+-import Dexie, { type EntityTable } from 'dexie';
+ 
+ class LlamaUiDatabase extends Dexie {
+ 	[IDXDB_TABLES.conversations]!: EntityTable<DatabaseConversation, string>;
+@@ -141,6 +142,13 @@ export class DatabaseService {
+ 			...fields
+ 		};
+ 
++		// An incognito chat is never written anywhere: it lives in the in-memory
++		// store for as long as the tab does. The flag is consumed here because
++		// this is the moment a conversation comes into being.
++		if (incognitoChatStore.consumePending()) {
++			return incognitoChatStore.createConversation(conversation);
++		}
++
+ 		await db[IDXDB_TABLES.conversations].add(conversation);
+ 
+ 		return conversation;
+@@ -158,6 +166,23 @@ export class DatabaseService {
+ 		message: Omit<DatabaseMessage, 'id'>,
+ 		parentId: string | null
+ 	): Promise<DatabaseMessage> {
++		// Incognito: build the message in memory instead, skipping both the parent
++		// lookup and every write, while still returning the shape callers expect.
++		if (incognitoChatStore.isIncognitoConversation(message.convId)) {
++			const incognitoMessage: DatabaseMessage = {
++				...message,
++				children: [],
++				id: uuid(),
++				parent: parentId,
++				toolCalls: message.toolCalls ?? ''
++			};
++
++			incognitoChatStore.trackMessage(message.convId, incognitoMessage);
++			incognitoChatStore.patchConversation(message.convId, { currNode: incognitoMessage.id });
++
++			return incognitoMessage;
++		}
++
+ 		return await db.transaction(
+ 			'rw',
+ 			[db[IDXDB_TABLES.conversations], db[IDXDB_TABLES.messages]],
+@@ -215,6 +240,12 @@ export class DatabaseService {
+ 			type: 'root'
+ 		};
+ 
++		if (incognitoChatStore.isIncognitoConversation(convId)) {
++			incognitoChatStore.trackMessage(convId, rootMessage);
++
++			return rootMessage.id;
++		}
++
+ 		await db[IDXDB_TABLES.messages].add(rootMessage);
+ 
+ 		return rootMessage.id;
+@@ -240,6 +271,23 @@ export class DatabaseService {
+ 			throw new Error('Cannot create system message with empty content');
+ 		}
+ 
++		if (incognitoChatStore.isIncognitoConversation(convId)) {
++			const incognitoSystemMessage: DatabaseMessage = {
++				children: [],
++				content: trimmedPrompt,
++				convId,
++				id: uuid(),
++				parent: parentId,
++				role: MessageRole.SYSTEM,
++				timestamp: Date.now(),
++				type: MessageRole.SYSTEM
++			};
++
++			incognitoChatStore.trackMessage(convId, incognitoSystemMessage);
++
++			return incognitoSystemMessage;
++		}
++
+ 		return await db.transaction('rw', db[IDXDB_TABLES.messages], async () => {
+ 			const parentMessage = await db[IDXDB_TABLES.messages].get(parentId);
+ 
+@@ -274,6 +322,13 @@ export class DatabaseService {
+ 		id: string,
+ 		options?: { deleteWithForks?: boolean }
+ 	): Promise<void> {
++		if (incognitoChatStore.isIncognitoConversation(id)) {
++			// Nothing on disk to delete; drop the in-memory copy instead.
++			incognitoChatStore.remove(id);
++
++			return;
++		}
++
+ 		await db.transaction(
+ 			'rw',
+ 			[db[IDXDB_TABLES.conversations], db[IDXDB_TABLES.messages]],
+@@ -315,6 +370,12 @@ export class DatabaseService {
+ 	 * @param messageId - ID of the message to delete
+ 	 */
+ 	static async deleteMessage(messageId: string): Promise<void> {
++		if (incognitoChatStore.isIncognitoMessage(messageId)) {
++			incognitoChatStore.removeMessage(messageId);
++
++			return;
++		}
++
+ 		await db.transaction('rw', db[IDXDB_TABLES.messages], async () => {
+ 			const message = await db[IDXDB_TABLES.messages].get(messageId);
+ 
+@@ -338,6 +399,19 @@ export class DatabaseService {
+ 		conversationId: string,
+ 		messageId: string
+ 	): Promise<string[]> {
++		if (incognitoChatStore.isIncognitoConversation(conversationId)) {
++			// An incognito conversation has no rows to cascade through, so this
++			// has to walk its in-memory messages instead - otherwise the delete
++			// silently does nothing at all (the query below finds no rows, so
++			// the id list comes back holding just the message itself).
++			const messages = incognitoChatStore.getMessages(conversationId);
++			const allToDelete = [messageId, ...findDescendantMessages(messages, messageId)];
++
++			for (const id of allToDelete) incognitoChatStore.removeMessage(id);
++
++			return allToDelete;
++		}
++
+ 		return await db.transaction('rw', db[IDXDB_TABLES.messages], async () => {
+ 			// Get all messages in the conversation to find descendants
+ 			const allMessages = await db[IDXDB_TABLES.messages]
+@@ -447,6 +521,8 @@ export class DatabaseService {
+ 	 * @returns Array of conversations
+ 	 */
+ 	static async getAllConversations(): Promise<DatabaseConversation[]> {
++		// Incognito chats are absent by construction - they were never added -
++		// so there is nothing to filter out here.
+ 		return await db[IDXDB_TABLES.conversations].orderBy('lastModified').reverse().toArray();
+ 	}
+ 
+@@ -457,6 +533,10 @@ export class DatabaseService {
+ 	 * @returns The conversation if found, otherwise undefined
+ 	 */
+ 	static async getConversation(id: string): Promise<DatabaseConversation | undefined> {
++		if (incognitoChatStore.isIncognitoConversation(id)) {
++			return incognitoChatStore.getConversation(id);
++		}
++
+ 		return await db[IDXDB_TABLES.conversations].get(id);
+ 	}
+ 
+@@ -467,6 +547,10 @@ export class DatabaseService {
+ 	 * @returns Array of messages in the conversation
+ 	 */
+ 	static async getConversationMessages(convId: string): Promise<DatabaseMessage[]> {
++		if (incognitoChatStore.isIncognitoConversation(convId)) {
++			return incognitoChatStore.getMessages(convId);
++		}
++
+ 		return await db[IDXDB_TABLES.messages].where('convId').equals(convId).sortBy('timestamp');
+ 	}
+ 
+@@ -585,6 +669,12 @@ export class DatabaseService {
+ 		id: string,
+ 		updates: Partial<Omit<DatabaseConversation, 'id'>>
+ 	): Promise<void> {
++		if (incognitoChatStore.isIncognitoConversation(id)) {
++			incognitoChatStore.patchConversation(id, updates);
++
++			return;
++		}
++
+ 		await db[IDXDB_TABLES.conversations].update(id, updates);
+ 	}
+ 
+@@ -612,6 +702,14 @@ export class DatabaseService {
+ 		id: string,
+ 		updates: Partial<Omit<DatabaseMessage, 'id'>>
+ 	): Promise<void> {
++		if (incognitoChatStore.isIncognitoMessage(id)) {
++			// Streaming writes land here every few hundred ms; for an incognito
++			// chat they update the in-memory copy and nothing else.
++			incognitoChatStore.patchMessage(id, updates);
++
++			return;
++		}
++
+ 		await db[IDXDB_TABLES.messages].update(id, updates);
+ 	}
+ 
+diff --git a/tools/ui/src/lib/stores/incognito-chat.svelte.ts b/tools/ui/src/lib/stores/incognito-chat.svelte.ts
+new file mode 100644
+index 0000000000..5b999e48b5
+--- /dev/null
++++ b/tools/ui/src/lib/stores/incognito-chat.svelte.ts
+@@ -0,0 +1,145 @@
++/**
++ * incognitoChatStore - chats that are never written to disk.
++ *
++ * An incognito chat is a conversation the app would normally persist, except
++ * that every write for it is intercepted here and kept in memory instead: no
++ * conversation row, no messages, nothing in the sidebar after a reload, no
++ * stream-resume state in localStorage. It lives exactly as long as the tab.
++ *
++ * The interception lives in DatabaseService (the single choke point every
++ * write goes through), not in the chat flow, so the rest of the app is unaware:
++ * callers still get a conversation back, still get messages back from
++ * getConversationMessages, still get their updates "accepted" - the objects
++ * simply never reach IndexedDB.
++ *
++ * Panel/frontend code drives it (see panel/frontend/chat-permission and the
++ * `/incognito` command): requestNext() marks that the next conversation to be
++ * created is incognito.
++ *
++ * Deliberately dependency-free: DatabaseService imports this module, and it is
++ * the lowest layer of the app, so this must not import services or stores back.
++ * It touches nothing but the types.
++ */
++
++import { SvelteSet } from 'svelte/reactivity';
++
++interface IncognitoConversation {
++	conversation: DatabaseConversation;
++	messages: DatabaseMessage[];
++}
++
++class IncognitoChatStore {
++	/** Conversation ids that must never reach IndexedDB (reactive: the UI badges them). */
++	incognitoConversationIds = $state(new SvelteSet<string>());
++
++	/** Messages belonging to incognito conversations, so id-keyed writes are caught too. */
++	messageIds = new SvelteSet<string>();
++
++	/** True once the user asked for the next chat to be incognito. */
++	pending = $state(false);
++
++	private store = new Map<string, IncognitoConversation>();
++
++	/** The next conversation created will be incognito. */
++	requestNext(): void {
++		this.pending = true;
++	}
++
++	/** Called when the user opens some other chat, so a stale request cannot leak onto it. */
++	cancelPending(): void {
++		this.pending = false;
++	}
++
++	consumePending(): boolean {
++		const wasPending = this.pending;
++
++		this.pending = false;
++
++		return wasPending;
++	}
++
++	isIncognitoConversation(convId?: string | null): boolean {
++		return !!convId && this.incognitoConversationIds.has(convId);
++	}
++
++	isIncognitoMessage(messageId?: string | null): boolean {
++		return !!messageId && this.messageIds.has(messageId);
++	}
++
++	get activeCount(): number {
++		return this.incognitoConversationIds.size;
++	}
++
++	// --- stand-ins for what the database would have held --------------------
++
++	createConversation(conversation: DatabaseConversation): DatabaseConversation {
++		this.incognitoConversationIds.add(conversation.id);
++		this.store.set(conversation.id, { conversation, messages: [] });
++
++		return conversation;
++	}
++
++	/** Remember a message (and its id) that must never be written. */
++	trackMessage(convId: string, message: DatabaseMessage): DatabaseMessage {
++		const entry = this.store.get(convId);
++
++		if (entry) entry.messages.push(message);
++
++		this.messageIds.add(message.id);
++
++		return message;
++	}
++
++	getConversation(convId: string): DatabaseConversation | undefined {
++		return this.store.get(convId)?.conversation;
++	}
++
++	getMessages(convId: string): DatabaseMessage[] {
++		return this.store.get(convId)?.messages ?? [];
++	}
++
++	listConversations(): DatabaseConversation[] {
++		return [...this.store.values()].map((entry) => entry.conversation);
++	}
++
++	/** Apply a patch in memory (updateMessage / updateConversation / updateCurrentNode). */
++	patchMessage(messageId: string, updates: Partial<Omit<DatabaseMessage, 'id'>>): void {
++		for (const entry of this.store.values()) {
++			const index = entry.messages.findIndex((m) => m.id === messageId);
++
++			if (index !== -1) {
++				entry.messages[index] = { ...entry.messages[index], ...updates };
++
++				return;
++			}
++		}
++	}
++
++	patchConversation(convId: string, updates: Partial<DatabaseConversation>): void {
++		const entry = this.store.get(convId);
++
++		if (entry) entry.conversation = { ...entry.conversation, ...updates };
++	}
++
++	removeMessage(messageId: string): void {
++		this.messageIds.delete(messageId);
++
++		for (const entry of this.store.values()) {
++			entry.messages = entry.messages.filter((m) => m.id !== messageId);
++		}
++	}
++
++	/** Drop a whole conversation - what "close incognito" does. */
++	remove(convId: string): void {
++		const entry = this.store.get(convId);
++
++		if (entry) {
++			for (const message of entry.messages) this.messageIds.delete(message.id);
++		}
++
++		this.store.delete(convId);
++		this.incognitoConversationIds.delete(convId);
++	}
++}
++
++export const incognitoChatStore = new IncognitoChatStore();

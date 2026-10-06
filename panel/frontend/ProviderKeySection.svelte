@@ -1,4 +1,5 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from './panel-origin';
 	// The API key editor for one remote provider, as it lives on that
 	// provider's own storefront page (OpenCode/OpenRouter/NIM) rather than in
 	// the right bar. Moved here from right bar to keep the sidebar a list of
@@ -13,7 +14,6 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 
-	const PANEL_ORIGIN = 'http://127.0.0.1:9010';
 	const SECRETS_URL = `${PANEL_ORIGIN}/api/secrets`;
 
 	let { provider }: { provider: string } = $props();

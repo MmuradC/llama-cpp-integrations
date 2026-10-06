@@ -59,6 +59,14 @@ PORT = int(os.environ.get("PANEL_PORT", "9010"))
 BRIDGE_URL = os.environ.get("MCP_BRIDGE_URL", "http://127.0.0.1:9000").rstrip("/")
 LLAMA_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080").rstrip("/")
 SD_URL = os.environ.get("SD_SERVER_URL", "http://127.0.0.1:1234").rstrip("/")
+# serve is a second llama.cpp host that serves the same UI and (after the
+# 2026-10-05 panel migration) the same browser origins. Its user is `use`, so
+# it cannot read this login's ~/.config/mcp-secrets pin files directly; every
+# pin/unpin mirrors the files over BatchMode ssh and reloads BOTH routers so
+# the pinned "remote" entries appear identically everywhere.
+SERVE_HOST = os.environ.get("SERVE_HOST", "serve")
+SERVE_PINS_DIR = os.environ.get("SERVE_PINS_DIR", "/home/use/.config/mcp-secrets")
+SERVE_LLAMA_URL = os.environ.get("SERVE_LLAMA_URL", "http://100.117.27.37:8080").rstrip("/")
 # comma-separated; includes the vite dev-server port (5173) so the frontend
 # can be iterated on with `npm run dev` without a full C++ rebuild each time
 ALLOW_ORIGINS = os.environ.get(
@@ -1455,16 +1463,48 @@ def _write_pinned(provider: str, entries: list[dict]) -> None:
     path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
+def _sync_pins_to_serve() -> None:
+    """Best-effort: blockingly mirror the three pinned-model files to serve's
+    LLAMA_REMOTE_MODELS_DIR so its router can register the same pins. Creates
+    the directory first; any failure is swallowed — pinning on this host must
+    never block on a ssh that may not exist (e.g. publish-key-less circles)."""
+    try:
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SERVE_HOST,
+             f"mkdir -p {SERVE_PINS_DIR}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20,
+        )
+        for cfg in PROVIDERS.values():
+            subprocess.run(
+                ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                 str(cfg["pinned_file"]), f"{SERVE_HOST}:{SERVE_PINS_DIR}/"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20,
+            )
+    except Exception:
+        pass
+
+
 async def _reload_router() -> None:
-    """Best-effort: ask the router to re-read its model sources (including
+    """Best-effort: ask the router(s) to re-read their model sources (including
     this pinned file) without a full restart. Fine to fail silently — a
     `systemctl --user restart llama-server` is always the guaranteed
     fallback, same as every other change to this project."""
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.get(f"{LLAMA_URL}/models", params={"reload": "true"}, timeout=10)
-    except Exception:
-        pass
+
+    async def poke(url: str) -> None:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.get(f"{url}/models", params={"reload": "true"}, timeout=10)
+        except Exception:
+            pass
+
+    await asyncio.gather(poke(LLAMA_URL), poke(SERVE_LLAMA_URL))
+
+
+async def _publish_pin_change() -> None:
+    """Mirror pins to serve (blocking, in a worker thread — a couple of scp
+    round-trips must not stall the event loop) then reload both routers."""
+    await asyncio.to_thread(_sync_pins_to_serve)
+    await _reload_router()
 
 
 def _provider_or_404(request: Request) -> str | None:
@@ -1621,7 +1661,7 @@ async def pinned_add(request: Request) -> JSONResponse:
     if not any(e["id"] == model_id for e in entries):
         entries.append({"id": model_id, "name": name})
         _write_pinned(provider, entries)
-    await _reload_router()
+    await _publish_pin_change()
     result: dict = {"pinned": entries}
     if note:
         result["warning"] = note
@@ -1640,7 +1680,7 @@ async def pinned_remove(request: Request) -> JSONResponse:
     model_id = str(body.get("id", "")).strip()
     entries = [e for e in _read_pinned(provider) if e["id"] != model_id]
     _write_pinned(provider, entries)
-    await _reload_router()
+    await _publish_pin_change()
     return JSONResponse({"pinned": entries})
 
 

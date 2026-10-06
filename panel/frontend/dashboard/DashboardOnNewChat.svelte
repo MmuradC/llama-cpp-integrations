@@ -61,11 +61,17 @@
 	});
 </script>
 
-{#if onStartScreen && available > 0}
-	<div
-		class="pointer-events-none fixed left-1/2 z-10 w-[min(64rem,calc(100vw-4rem))] -translate-x-1/2 overflow-y-auto"
-		style="bottom: {GAP_PX}px; max-height: {available}px;"
-	>
-		<UsageDashboard />
-	</div>
+{#if onStartScreen && (inline || available > 0)}
+	{#if inline}
+		<div class="px-1 pb-2">
+			<UsageDashboard />
+		</div>
+	{:else}
+		<div
+			class="pointer-events-none fixed left-1/2 z-10 w-[min(64rem,calc(100vw-4rem))] -translate-x-1/2 overflow-y-auto"
+			style="bottom: {GAP_PX}px; max-height: {available}px;"
+		>
+			<UsageDashboard />
+		</div>
+	{/if}
 {/if}

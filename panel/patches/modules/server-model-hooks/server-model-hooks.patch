@@ -1,5 +1,5 @@
 diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
-index db0fac9..bed82a1 100644
+index db0fac9952..bed82a1dd7 100644
 --- a/tools/server/server-models.cpp
 +++ b/tools/server/server-models.cpp
 @@ -18,6 +18,7 @@
@@ -258,7 +258,7 @@ index db0fac9..bed82a1 100644
                  res_err(res, format_error_response("Stream not found or expired", ERROR_TYPE_NOT_FOUND));
              }
 diff --git a/tools/server/server-models.h b/tools/server/server-models.h
-index 5cbb6a8..4d76505 100644
+index 5cbb6a801e..4d76505c42 100644
 --- a/tools/server/server-models.h
 +++ b/tools/server/server-models.h
 @@ -41,6 +41,7 @@ enum server_model_source {
@@ -278,7 +278,7 @@ index 5cbb6a8..4d76505 100644
      }
  }
 diff --git a/tools/server/server-tools.cpp b/tools/server/server-tools.cpp
-index 12e9dbb..5d83f9a 100644
+index 12e9dbb8cf..5d83f9a5b4 100644
 --- a/tools/server/server-tools.cpp
 +++ b/tools/server/server-tools.cpp
 @@ -159,6 +159,9 @@ public:

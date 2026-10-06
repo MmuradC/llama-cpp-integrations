@@ -1,3 +1,4 @@
+import { PANEL_ORIGIN } from '../panel-origin';
 /**
  * chatPermissionStore - per-chat permission modes, panel-owned.
  *
@@ -21,7 +22,6 @@ import { permissionModeStore } from '$lib/stores/permission-mode.svelte';
 import { chatPermissionDb, type ChatPermissionMode } from './db';
 
 /** Same origin the rest of the panel uses (see RightBar.svelte, upload-image). */
-const PANEL_ORIGIN = 'http://127.0.0.1:9010';
 const PERMISSION_MODE_API = `${PANEL_ORIGIN}/api/permission-mode`;
 
 export class ChatPermissionStore {

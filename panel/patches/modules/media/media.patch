@@ -1,0 +1,191 @@
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte
+index 93d8990184..c6b2615c02 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlockReadMedia.svelte
+@@ -43,10 +43,9 @@
+ 	const audioMimeType = $derived(readMediaMeta?.mimeType ?? MimeTypeAudio.MP3_MPEG);
+ </script>
+ 
+-<ToolCallBlock {isStreaming} meta={readMediaMeta} {onToggle} {open} {section}>
++<ToolCallBlock {section} {open} {isStreaming} meta={readMediaMeta} {onToggle}>
+ 	{#snippet titleSnippet()}
+ 		<span class="text-muted-foreground">Read media </span>
+-
+ 		<span class="font-mono">{readMediaMeta?.fileName}</span>
+ 	{/snippet}
+ 
+@@ -58,7 +57,7 @@
+ 				</div>
+ 			{:else if mediaAttachment.type === AttachmentType.AUDIO}
+ 				<div class="mt-2">
+-					<audio class="w-full rounded-lg" controls>
++					<audio controls class="w-full rounded-lg">
+ 						<source
+ 							src={createBase64DataUrl(audioMimeType, mediaAttachment.base64Data)}
+ 							type={audioMimeType}
+@@ -69,10 +68,10 @@
+ 			{:else}
+ 				<div class="mt-2">
+ 					<img
++						src={mediaAttachment.base64Url}
+ 						alt={readMediaMeta?.fileName ?? 'media'}
+ 						class="max-h-[60vh] max-w-full rounded-lg object-contain shadow-lg"
+ 						loading="lazy"
+-						src={mediaAttachment.base64Url}
+ 					/>
+ 				</div>
+ 			{/if}
+@@ -82,7 +81,6 @@
+ 					{#if readMediaMeta?.sizeBytes}
+ 						<span>Size: {readMediaMeta.sizeBytes} bytes</span>
+ 					{/if}
+-
+ 					{#if readMediaMeta?.mimeType}
+ 						<span>MIME: {readMediaMeta.mimeType}</span>
+ 					{/if}
+diff --git a/tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts b/tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts
+index 30261f73d3..3f546964ed 100644
+--- a/tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts
++++ b/tools/ui/src/lib/hooks/use-chat-screen-file-upload.svelte.ts
+@@ -7,8 +7,49 @@
+  * as reactive getters so validation tracks the model in real time.
+  */
+ 
+-import { filterFilesByModalities, isFileTypeSupported } from '$lib/utils';
++import { FileTypeCategory } from '$lib/enums';
++import { filterFilesByModalities, getFileTypeCategory, isFileTypeSupported } from '$lib/utils';
+ import { processFilesToChatUploaded } from '$lib/utils/browser-only';
++import { PANEL_ORIGIN } from '@mcp-panel/panel-origin';
++
++// The panel backend (see panel/backend/server.py, upload_image()) - a separate
++// process from the router, not proxied through it. It writes the upload to
++// disk and answers with the path. The origin is derived from the page, not
++// hardcoded: pasting an image from a phone must reach sn1p, not the phone.
++const IMAGE_UPLOAD_URL = `${PANEL_ORIGIN}/api/upload-image`;
++
++/**
++ * Save a pasted/dropped image that the active model cannot see inline.
++ *
++ * The path is what makes the image reachable at all: llama.cpp offers its own
++ * read_media tool only to models that can see, so for a text-only model a
++ * vision-capable MCP tool (vision_inspect / vision_ocr) is the way in, and it
++ * needs a file on disk. The path is returned so it can travel on the
++ * attachment itself (ChatUploadedFile.savedPath) and be handed to the model as
++ * text at request time - the user sees the preview, not a path in their
++ * message, and the model still gets its route to the image.
++ *
++ * Failures are swallowed on purpose: if the panel backend is down, the image
++ * simply has no saved path, exactly as before this existed.
++ */
++async function saveImageForPathInsertion(file: File): Promise<string | null> {
++	const body = new FormData();
++
++	body.set('file', file);
++
++	try {
++		const res = await fetch(IMAGE_UPLOAD_URL, { body, method: 'POST' });
++
++		if (!res.ok) return null;
++
++		const { path } = (await res.json()) as { path?: string };
++
++		return path ?? null;
++	} catch {
++		// panel backend unreachable - the image just stays unattached, no crash
++		return null;
++	}
++}
+ 
+ interface UseChatScreenFileUploadOptions {
+ 	capabilities: () => { hasVision: boolean; hasAudio: boolean; hasVideo: boolean };
+@@ -50,7 +91,45 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
+ 		);
+ 		const allUnsupportedFiles = [...generallyUnsupported, ...unsupportedFiles];
+ 
+-		if (allUnsupportedFiles.length > 0) {
++		// An image the active model cannot see is not a dead end: save it to disk
++		// and let a vision MCP tool read it by path. Only files that are genuinely
++		// unusable should raise the "unsupported" dialog.
++		const imagesNeedingFallback = unsupportedFiles.filter(
++			(file) => getFileTypeCategory(file.type) === FileTypeCategory.IMAGE
++		);
++
++		if (imagesNeedingFallback.length > 0) {
++			// Saved to disk for the model-independent route (see
++			// saveImageForPathInsertion above)...
++			const paths = await Promise.all(imagesNeedingFallback.map(saveImageForPathInsertion));
++
++			// ...and still attached, so the composer shows the same thumbnail
++			// preview a vision model would get rather than a bare path. The path
++			// rides on the attachment: the request tells a text-only model where
++			// the file is, while the user only ever sees the image.
++			const previews = await processFilesToChatUploaded(
++				imagesNeedingFallback,
++				options.activeModelId() ?? undefined
++			);
++
++			previews.forEach((file, index) => {
++				const path = paths[index];
++
++				if (path) file.savedPath = path;
++			});
++
++			uploadedFiles = [...uploadedFiles, ...previews];
++		}
++
++		const remainingModalityUnsupported = unsupportedFiles.filter(
++			(file) => !imagesNeedingFallback.includes(file)
++		);
++		const remainingUnsupportedFiles = [
++			...generallyUnsupported,
++			...remainingModalityUnsupported
++		];
++
++		if (remainingUnsupportedFiles.length > 0) {
+ 			const supportedTypes: string[] = ['text files', 'PDFs'];
+ 			const caps = options.capabilities();
+ 
+@@ -63,7 +142,7 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
+ 			fileErrorData = {
+ 				generallyUnsupported,
+ 				modalityReasons,
+-				modalityUnsupported: unsupportedFiles,
++				modalityUnsupported: remainingModalityUnsupported,
+ 				supportedTypes
+ 			};
+ 			showFileErrorDialog = true;
+diff --git a/tools/ui/src/lib/services/read-media.service.ts b/tools/ui/src/lib/services/read-media.service.ts
+index 2858795e8b..ada5a934ad 100644
+--- a/tools/ui/src/lib/services/read-media.service.ts
++++ b/tools/ui/src/lib/services/read-media.service.ts
+@@ -81,9 +81,17 @@ export class ReadMediaService {
+ 				imageMime || audioMime
+ 					? `the current model cannot perceive ".${extension}" files`
+ 					: `".${extension}" is not a supported media type`;
++			// A capability mismatch is not a dead end after all: the file is on
++			// disk, and a vision-capable MCP tool can read it by path even when
++			// this model cannot perceive images. Point at it rather than leaving
++			// the model to conclude the file is unreadable.
++			const hint =
++				imageMime || audioMime
++					? ' If a vision_ocr or vision_inspect tool is available, call that instead to analyze the file.'
++					: '';
+ 
+ 			return {
+-				content: `Error: ${reason}. Supported: ${supported.join(', ')}.`,
++				content: `Error: ${reason}. Supported: ${supported.join(', ')}.${hint}`,
+ 				isError: true
+ 			};
+ 		}
+diff --git a/tools/ui/src/lib/utils/convert-files-to-extra.ts b/tools/ui/src/lib/utils/convert-files-to-extra.ts
+index 735e91c44a..8b574fa2b2 100644
+--- a/tools/ui/src/lib/utils/convert-files-to-extra.ts
++++ b/tools/ui/src/lib/utils/convert-files-to-extra.ts
+@@ -71,6 +71,7 @@ export async function parseFilesToMessageExtras(
+ 				extras.push({
+ 					base64Url,
+ 					name: file.name,
++					savedPath: file.savedPath,
+ 					size: file.size,
+ 					type: AttachmentType.IMAGE
+ 				});

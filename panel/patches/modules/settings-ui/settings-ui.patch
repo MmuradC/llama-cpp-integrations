@@ -1,0 +1,200 @@
+diff --git a/tools/ui/src/lib/constants/settings-keys.constants.ts b/tools/ui/src/lib/constants/settings-keys.constants.ts
+index 2c923cee38..c8761c7587 100644
+--- a/tools/ui/src/lib/constants/settings-keys.constants.ts
++++ b/tools/ui/src/lib/constants/settings-keys.constants.ts
+@@ -54,7 +54,6 @@ export const SETTINGS_KEYS = {
+ 	SHOW_FULL_PATH_IN_MENTIONS: 'showFullPathInMentions',
+ 	// Display
+ 	SHOW_MESSAGE_STATS: 'showMessageStats',
+-	SHOW_MODEL_ORG_NAME_IN_TRIGGER: 'showModelOrgNameInTrigger',
+ 	SHOW_MODEL_QUANTIZATION: 'showModelQuantization',
+ 	SHOW_MODEL_TAGS: 'showModelTags',
+ 	SHOW_RAW_MODEL_NAMES: 'showRawModelNames',
+diff --git a/tools/ui/src/lib/constants/settings.constants.ts b/tools/ui/src/lib/constants/settings.constants.ts
+index 7140bbcc4a..b196999589 100644
+--- a/tools/ui/src/lib/constants/settings.constants.ts
++++ b/tools/ui/src/lib/constants/settings.constants.ts
+@@ -82,7 +82,16 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
+ 				type: SettingsFieldType.INPUT
+ 			},
+ 			{
+-				defaultValue: '',
++				defaultValue:
++					'When asked to produce a whole file (e.g. a full HTML page), do not call ' +
++					'write_file with the content as the tool argument - a token limit cutting off ' +
++					'mid-argument breaks the JSON and cannot be recovered by continuing. Instead, ' +
++					'write the entire file as one fenced code block in your normal reply, then on ' +
++					'its own line right after the closing fence add a markdown link to the ' +
++					'absolute save path using the file:// scheme, for example ' +
++					'[dashboard.html](file:///home/user/project/dashboard.html). If you run out ' +
++					'of tokens partway through, continue the same code block in your next reply - ' +
++					'do not restart it or wrap it in a tool call.',
+ 				help: 'The starting message that defines how model should behave.',
+ 				key: SETTINGS_KEYS.SYSTEM_MESSAGE,
+ 				label: 'System Message',
+@@ -111,8 +120,9 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
+ 				type: SettingsFieldType.CHECKBOX
+ 			},
+ 			{
+-				defaultValue: true,
++				defaultValue: false,
+ 				help: 'Automatically show microphone button instead of send button when textarea is empty for models with audio modality support.',
++				isExperimental: true,
+ 				key: SETTINGS_KEYS.AUTO_MIC_ON_EMPTY,
+ 				label: 'Show microphone on empty input',
+ 				type: SettingsFieldType.CHECKBOX
+@@ -282,13 +292,6 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
+ 				label: 'Show model tags',
+ 				type: SettingsFieldType.CHECKBOX
+ 			},
+-			{
+-				defaultValue: false,
+-				help: 'Display the organization name in the model selector trigger button.',
+-				key: SETTINGS_KEYS.SHOW_MODEL_ORG_NAME_IN_TRIGGER,
+-				label: 'Show organization name in model selector trigger',
+-				type: SettingsFieldType.CHECKBOX
+-			},
+ 			{
+ 				defaultValue: false,
+ 				help: 'Display the current build version in the bottom-right corner of the interface.',
+diff --git a/tools/ui/src/lib/hooks/use-settings-navigation.svelte.ts b/tools/ui/src/lib/hooks/use-settings-navigation.svelte.ts
+new file mode 100644
+index 0000000000..b1b0456a83
+--- /dev/null
++++ b/tools/ui/src/lib/hooks/use-settings-navigation.svelte.ts
+@@ -0,0 +1,45 @@
++import { beforeNavigate } from '$app/navigation';
++import { page } from '$app/state';
++import { ROUTES } from '$lib/constants';
++import { settingsReferrer } from '$lib/stores';
++
++export interface ChatSettings {
++	reset: () => void;
++}
++
++export function useSettingsNavigation() {
++	const subroute = $state({
++		activePanel: 'chat' as 'chat' | 'settings' | 'mcp',
++		chatSettingsRef: undefined as ChatSettings | undefined
++	});
++	const isSettingsRoute = $derived(!!page.route.id?.startsWith('/settings'));
++
++	beforeNavigate(({ from, to }) => {
++		if (to?.route?.id?.startsWith('/settings') && !from?.route?.id?.startsWith('/settings')) {
++			settingsReferrer.url = window.location.hash || ROUTES.START;
++		}
++	});
++
++	$effect(() => {
++		if (subroute.activePanel === 'settings' && subroute.chatSettingsRef) {
++			subroute.chatSettingsRef.reset();
++		}
++	});
++
++	// Return to chat when navigating to a new route
++	$effect(() => {
++		void page.url;
++
++		subroute.activePanel = 'chat';
++	});
++
++	return {
++		get isSettingsRoute() {
++			return isSettingsRoute;
++		},
++
++		get panel() {
++			return subroute;
++		}
++	};
++}
+diff --git a/tools/ui/src/lib/stores/settings/referrer.svelte.ts b/tools/ui/src/lib/stores/settings/referrer.svelte.ts
+new file mode 100644
+index 0000000000..d1055cc6e8
+--- /dev/null
++++ b/tools/ui/src/lib/stores/settings/referrer.svelte.ts
+@@ -0,0 +1,19 @@
++/**
++ * settingsReferrer - Remembers the settings route to return to after exit
++ *
++ * Tracks the last settings section the user was on so the app can return
++ * there after a fallback exit. Standalone reactive value, no host.
++ */
++
++import { ROUTES } from '$lib/constants';
++
++let _url = $state<string>(ROUTES.SETTINGS_EXIT);
++
++export const settingsReferrer = {
++	get url() {
++		return _url;
++	},
++	set url(value: string) {
++		_url = value;
++	}
++};
+diff --git a/tools/ui/src/routes/settings/+layout.svelte b/tools/ui/src/routes/settings/+layout.svelte
+new file mode 100644
+index 0000000000..993d64d0b6
+--- /dev/null
++++ b/tools/ui/src/routes/settings/+layout.svelte
+@@ -0,0 +1,38 @@
++<script lang="ts">
++	import { X } from '@lucide/svelte';
++	import { browser } from '$app/environment';
++	import { goto } from '$app/navigation';
++	import { page } from '$app/state';
++	import { ActionIcon } from '$lib/components/app';
++	import { ROUTES } from '$lib/constants';
++
++	let { children } = $props();
++
++	let previousRouteId = $state<string | null>(null);
++
++	$effect(() => {
++		const currentId = page.route.id;
++
++		return () => {
++			previousRouteId = currentId;
++		};
++	});
++
++	function handleClose() {
++		const prevIsSettings = previousRouteId?.startsWith('/settings');
++
++		if (browser && window.history.length > 1 && !prevIsSettings) {
++			history.back();
++		} else {
++			goto(ROUTES.SETTINGS_EXIT);
++		}
++	}
++</script>
++
++<div class="fixed top-4.5 right-4 z-50 md:hidden">
++	<ActionIcon icon={X} tooltip="Close" onclick={handleClose} />
++</div>
++
++<div class="min-h-full">
++	{@render children?.()}
++</div>
+diff --git a/tools/ui/src/routes/settings/[[section]]/+page.svelte b/tools/ui/src/routes/settings/[[section]]/+page.svelte
+new file mode 100644
+index 0000000000..d4faae0449
+--- /dev/null
++++ b/tools/ui/src/routes/settings/[[section]]/+page.svelte
+@@ -0,0 +1,15 @@
++<script lang="ts">
++	import { afterNavigate, replaceState } from '$app/navigation';
++	import { page } from '$app/state';
++	import { SettingsChat } from '$lib/components/app/settings';
++	import { SETTINGS_SECTION_SLUGS } from '$lib/constants';
++	import { RouterService } from '$lib/services';
++
++	afterNavigate(() => {
++		if (!page.params.section) {
++			replaceState(RouterService.settings(SETTINGS_SECTION_SLUGS.GENERAL), {});
++		}
++	});
++</script>
++
++<SettingsChat initialSection={(page.params as Record<string, string | undefined>).section} />

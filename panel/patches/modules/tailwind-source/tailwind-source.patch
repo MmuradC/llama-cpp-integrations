@@ -1,0 +1,37 @@
+diff --git a/tools/ui/src/app.css b/tools/ui/src/app.css
+index f9b544bebc..ead949e470 100644
+--- a/tools/ui/src/app.css
++++ b/tools/ui/src/app.css
+@@ -1,11 +1,32 @@
+ @import 'tailwindcss';
+ @source '.';
++/*
++ * The panel's own UI lives outside this tree (panel/frontend, see
++ * panel/patches/README.md). Tailwind generates a class only if it is found in
++ * a scanned source file, so without this line every utility used *only* by the
++ * panel - the dashboard's grid-cols-4, its colour ramp, its spacing - is
++ * silently never generated, and those components render as unstyled elements.
++ * Absolute path for the same reason vite.config.ts uses one: the panel is not
++ * inside this tree to be referenced relatively.
++ */
++@source '/home/murad/Documents/GitHub/llama.cpp/panel/frontend';
+ @plugin '@tailwindcss/forms';
+ @plugin '@tailwindcss/typography';
+ @import 'tw-animate-css';
+ 
+ @custom-variant dark (&:is(.dark *));
+ 
++/* Scrollable regions with no visible scrollbar: scroll still works by
++   wheel/touch/drag, the bar just never occupies space or draws itself. */
++@utility no-scrollbar {
++	scrollbar-width: none;
++	-ms-overflow-style: none;
++
++	&::-webkit-scrollbar {
++		display: none;
++	}
++}
++
+ :root {
+ 	--radius: 0.625rem;
+ 	--background: oklch(1 0 0);

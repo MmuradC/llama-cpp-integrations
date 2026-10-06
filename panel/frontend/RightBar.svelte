@@ -1,4 +1,5 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from './panel-origin';
 	// Lives entirely outside llama.cpp's own source tree — see ../README.md.
 	// Reads its data from a small local backend (panel/backend/server.py) that
 	// does its own MCP handshake against each server, rather than trusting the
@@ -30,6 +31,15 @@
 	// used everywhere the left sidebar shows Logo, mirrored here. Not
 	// misc/Logo: that renders the generic llama mark, not this set's own.
 	import IntegrationsMark from './IntegrationsMark.svelte';
+	import { page } from '$app/state';
+	import { deviceStore, conversationsStore } from '$lib/stores';
+
+	/** Same start screen detection as DashboardOnNewChat: on phones there is no
+	 *  room below the composer for the overlay card, so the drawer shows the
+	 *  dashboard inline instead. */
+	const onStartScreen = $derived(
+		conversationsStore.activeConversation === null && !page.url.hash.includes('/chat/')
+	);
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 		import { ScrollArea } from '$lib/components/ui/scroll-area';
@@ -56,7 +66,6 @@
 	 *  shows the logo mark itself; hovering reveals the expand arrow. */
 	let logoHovered = $state(false);
 
-	const PANEL_ORIGIN = 'http://127.0.0.1:9010';
 	const DASHBOARD_URL = `${PANEL_ORIGIN}/api/dashboard`;
 	const USAGE_SUMMARY_URL = `${PANEL_ORIGIN}/api/usage-summary`;
 	const BACKGROUND_TASKS_URL = `${PANEL_ORIGIN}/api/background-tasks`;
@@ -478,9 +487,12 @@
 		// No `md:w-auto` in this array: with it present, the generated stylesheet
 		// put it after `md:w-72`, so the expanded panel sized itself to its content
 		// (~620px with a long model name) instead of matching the left sidebar's
-		// 288px. Collapsed (md:w-12) and expanded (md:w-72) now mirror the left
-		// aside exactly; mobile keeps the full-width treatment.
-		'w-[calc(100dvw-1rem)]',
+		// 288px. Collapsed (md:w-12) and expanded (md:w-72) mirror the left aside.
+		// Widening the collapsed strip came from an earlier mobile design that made
+		// even the collapsed state full-width, which centered the mark at the top
+		// of the viewport on phones; the collapsed strip is narrow on every view,
+		// the full-width treatment is for the expanded phone drawer only.
+		isExpanded ? 'w-[calc(100dvw-1rem)]' : 'w-12',
 		'md:h-[calc(100dvh-1.125rem)]',
 		isExpanded && 'h-[calc(100dvh-1rem)]',
 		'rounded-3xl md:rounded-2xl',
@@ -559,6 +571,12 @@
 						</Badge>
 					{/if}
 				</div>
+
+				<!-- On phones the usage dashboard has no room below the composer,
+				     so it leads the expanded drawer on the start screen. -->
+				{#if deviceStore.isMobile && onStartScreen}
+					<DashboardOnNewChat inline />
+				{/if}
 
 				<!-- Projects first: it is the thing you pick before starting a chat,
 				     where Status and Providers are things you check afterwards. -->
@@ -749,5 +767,15 @@
 			backdrop-filter: blur(1rem);
 			pointer-events: none;
 		}
+	}
+
+	/* Scraping request honored: the drawer keeps scrolling on wheel/swipe,
+	   but its bar is never drawn or reserved - the panel looks borderless. */
+	aside :global([data-radix-scroll-area-viewport]) {
+		scrollbar-width: none;
+		-ms-overflow-style: none;
+	}
+	aside :global([data-radix-scroll-area-viewport])::-webkit-scrollbar {
+		display: none;
 	}
 </style>

@@ -1,3 +1,4 @@
+import { PANEL_ORIGIN } from '../panel-origin';
 /**
  * Slash commands contributed by the panel.
  *
@@ -114,7 +115,6 @@ import {
 import type { Component } from 'svelte';
 
 /** Origin of panel/backend/server.py — the same constant RightBar.svelte uses. */
-const PANEL_ORIGIN = 'http://127.0.0.1:9010';
 
 /** The backend's HTML usage pages, keyed by the model-id provider prefix. */
 const USAGE_PAGES: Record<string, string> = {

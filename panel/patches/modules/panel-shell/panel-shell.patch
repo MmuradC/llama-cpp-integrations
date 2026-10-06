@@ -1,0 +1,105 @@
+diff --git a/tools/ui/src/routes/+layout.svelte b/tools/ui/src/routes/+layout.svelte
+index 38b6562715..0ee88f239f 100644
+--- a/tools/ui/src/routes/+layout.svelte
++++ b/tools/ui/src/routes/+layout.svelte
+@@ -5,6 +5,8 @@
+ 	import { base } from '$app/paths';
+ 	import { page } from '$app/state';
+ 	import { SidebarNavigation } from '$lib/components/app';
++	import RightBar from '@mcp-panel/RightBar.svelte';
++	import { PanelRightClose, PanelRightOpen } from '@lucide/svelte';
+ 	import { PwaMetaTags, PwaRefreshAlert } from '$lib/components/pwa';
+ 	import * as Tooltip from '$lib/components/ui/tooltip';
+ 	import {
+@@ -185,6 +187,25 @@
+ 		// snapshot of every backend running stream on first load, populates the sidebar spinners
+ 		// so the user sees each conv that has a live inference, even ones not opened yet
+ 		void chatStore.syncRemoteRunningStreams();
++
++		// A reload mid-compaction kills the summary stream and discards minutes
++		// of remote work — several runs tonight were lost exactly this way, and
++		// it read as "compact doesn't work". beforeunload's optional outcome:
++		// the browser shows its own "Leave site?" dialog when returnValue is
++		// set, so a habitual F5 costs one confirmation instead of a lost run.
++		// Deliberately compaction-only: normal chats are resumable streams, not
++		// long fan-outs, and nagging on every reload would just train the user
++		// to click through dialogs.
++		const beforeUnload = (event: BeforeUnloadEvent) => {
++			if (chatStore.compactionRunning) {
++				event.preventDefault();
++				event.returnValue = 'A conversation is still being compacted — leaving now discards it.';
++			}
++		};
++
++		window.addEventListener('beforeunload', beforeUnload);
++
++		return () => window.removeEventListener('beforeunload', beforeUnload);
+ 	});
+ 
+ 	// refresh that snapshot when the tab returns to the foreground, a stream may have advanced
+@@ -296,7 +317,7 @@
+ 
+ <svelte:head>
+ 	{#if pwaAssetsHead.themeColor}
+-		<meta content={pwaAssetsHead.themeColor.content} name="theme-color" />
++		<meta name="theme-color" content={pwaAssetsHead.themeColor.content} />
+ 	{/if}
+ 
+ 	{#if settingsStore.config.customCss}
+@@ -310,7 +331,7 @@
+ 	<PwaMetaTags />
+ </svelte:head>
+ 
+-<svelte:window bind:innerHeight bind:innerWidth onkeydown={handleKeydown} />
++<svelte:window onkeydown={handleKeydown} bind:innerHeight bind:innerWidth />
+ <svelte:document onvisibilitychange={handleVisibilityChange} />
+ 
+ <Tooltip.Provider delayDuration={TOOLTIP_DELAY_DURATION}>
+@@ -328,6 +349,8 @@
+ 		<div class="flex-1">
+ 			{@render children?.()}
+ 		</div>
++
++		<RightBar iconOpen={PanelRightOpen} iconClose={PanelRightClose} />
+ 	</div>
+ 
+ 	<ModeWatcher />
+@@ -342,8 +365,8 @@
+ 	{/if}
+ 
+ 	<PwaRefreshAlert
+-		forceReload={pwa.needRefreshByStorage}
+ 		needRefresh={$needRefresh || pwa.needRefreshByStorage}
++		forceReload={pwa.needRefreshByStorage}
+ 		{updateServiceWorker}
+ 	/>
+ </div>
+diff --git a/tools/ui/vite.config.ts b/tools/ui/vite.config.ts
+index 0f24a600bf..9cce795362 100644
+--- a/tools/ui/vite.config.ts
++++ b/tools/ui/vite.config.ts
+@@ -47,13 +47,22 @@ export default defineConfig(({ mode }) => {
+ 
+ 		resolve: {
+ 			alias: {
+-				'katex-fonts': resolve('node_modules/katex/dist/fonts')
++				'katex-fonts': resolve('node_modules/katex/dist/fonts'),
++				// Right-bar panel: lives entirely outside this tree, see
++				// /home/murad/Documents/GitHub/llama.cpp/panel/README.md. This alias plus
++				// the one import + one render line in routes/+layout.svelte is the
++				// whole diff against upstream — everything else is out here.
++				'@mcp-panel': '/home/murad/Documents/GitHub/llama.cpp/panel/frontend'
+ 			}
+ 		},
+ 
+ 		server: {
+ 			fs: {
+-				allow: [searchForWorkspaceRoot(process.cwd()), resolve(__dirname, 'tests')]
++				allow: [
++					searchForWorkspaceRoot(process.cwd()),
++					resolve(__dirname, 'tests'),
++					'/home/murad/Documents/GitHub/llama.cpp/panel/frontend'
++				]
+ 			},
+ 			headers: {
+ 				'Cross-Origin-Embedder-Policy': 'require-corp',

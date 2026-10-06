@@ -1,4 +1,5 @@
 <script lang="ts">
+import { PANEL_ORIGIN } from './panel-origin';
 	// Lives entirely outside llama.cpp's own source tree — see ../README.md.
 	// Reached from the "RAG Editor" button in RightBar.svelte. The
 	// route file that makes this discoverable to SvelteKit's router is
@@ -19,7 +20,6 @@
 	import { Input } from '$lib/components/ui/input';
 	import { onDestroy, onMount } from 'svelte';
 
-	const PANEL_ORIGIN = 'http://127.0.0.1:9010';
 	const COLLECTIONS_URL = `${PANEL_ORIGIN}/api/rag/collections`;
 	const POLL_MS = 2000;
 
